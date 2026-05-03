@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+
+# Vitest browser mode failure artifacts (screenshots, attachments)
+.vitest-attachments/
+__screenshots__/
+
+*.log
+.DS_Store
+.idea/
+.vscode/

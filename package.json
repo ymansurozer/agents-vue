@@ -1,0 +1,83 @@
+{
+  "name": "agents-vue",
+  "version": "0.0.0",
+  "description": "Vue 3 composable for Cloudflare Agents — a port of @cloudflare/ai-chat/react's useAgentChat.",
+  "keywords": [
+    "vue",
+    "vue3",
+    "cloudflare",
+    "agents",
+    "ai",
+    "chat",
+    "websocket",
+    "ai-sdk",
+    "composable"
+  ],
+  "homepage": "https://github.com/ymansurozer/agents-vue",
+  "bugs": "https://github.com/ymansurozer/agents-vue/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ymansurozer/agents-vue.git"
+  },
+  "license": "MIT",
+  "author": "Yusuf Mansur Özer",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "dev": "unbuild --watch",
+    "build": "unbuild",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "vue-tsc --noEmit",
+    "release": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build && changelogen --release && git push --follow-tags"
+  },
+  "peerDependencies": {
+    "@ai-sdk/vue": "^3.0.0",
+    "agents": ">=0.11.0 <1.0.0",
+    "ai": "^6.0.0",
+    "vue": "^3.3.4"
+  },
+  "devDependencies": {
+    "@ai-sdk/vue": "^3.0.0",
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^22.0.0",
+    "@vitest/browser": "^4.1.5",
+    "@vitest/browser-playwright": "^4.1.5",
+    "agents": "^0.11.4",
+    "ai": "^6.0.0",
+    "changelogen": "^0.6.2",
+    "eslint": "^9.0.0",
+    "playwright": "^1.49.0",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.0.0",
+    "unbuild": "^3.0.0",
+    "vitest": "^4.1.5",
+    "vitest-browser-vue": "^2.1.0",
+    "vue": "^3.5.0",
+    "vue-tsc": "^3.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.0.0"
+}
