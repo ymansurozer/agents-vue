@@ -1,6 +1,6 @@
 {
   "name": "agents-vue",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Vue 3 composable for Cloudflare Agents — a port of @cloudflare/ai-chat/react's useAgentChat.",
   "keywords": [
     "vue",
