@@ -138,7 +138,22 @@ describe("WebSocketChatTransport", () => {
       expect((error as Error).message).toBe("boom");
     });
 
-    it("sends cf_agent_chat_request_cancel and errors stream on abort", async () => {
+    it("errors the stream locally on a generic abort without cancelling the server turn (default)", async () => {
+      const ac = new AbortController();
+      const stream = await transport.sendMessages(sendMessagesArgs([userMessage("hi")], { abortSignal: ac.signal }));
+
+      const drainPromise = drainStream(stream);
+      ac.abort();
+
+      const { error } = await drainPromise;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).name).toBe("AbortError");
+      // Local-only by default (0.7.0): the server turn keeps running, so no cancel frame.
+      expect(socket.lastSentOfType("cf_agent_chat_request_cancel")).toBeUndefined();
+    });
+
+    it("sends cf_agent_chat_request_cancel on a generic abort when cancelOnClientAbort is true", async () => {
+      transport = new WebSocketChatTransport({ socket, cancelOnClientAbort: true });
       const ac = new AbortController();
       const stream = await transport.sendMessages(sendMessagesArgs([userMessage("hi")], { abortSignal: ac.signal }));
       const req = socket.lastSentOfType<{ id: string }>("cf_agent_use_chat_request")!;
@@ -147,10 +162,131 @@ describe("WebSocketChatTransport", () => {
       ac.abort();
 
       const { error } = await drainPromise;
-      expect(error).toBeInstanceOf(Error);
       expect((error as Error).name).toBe("AbortError");
       const cancel = socket.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel");
       expect(cancel?.id).toBe(req.id);
+    });
+  });
+
+  // ── server-turn cancellation (explicit vs generic) ──────────────
+
+  describe("cancelActiveServerTurn", () => {
+    it("cancels the active locally-initiated turn even with cancelOnClientAbort false (default)", async () => {
+      const stream = await transport.sendMessages(sendMessagesArgs([userMessage("hi")]));
+      const req = socket.lastSentOfType<{ id: string }>("cf_agent_use_chat_request")!;
+
+      const drainPromise = drainStream(stream);
+      expect(transport.cancelActiveServerTurn()).toBe(true);
+
+      const { error } = await drainPromise;
+      expect((error as Error).name).toBe("AbortError");
+      const cancel = socket.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel");
+      expect(cancel?.id).toBe(req.id);
+    });
+
+    it("cancels a server-observed (broadcast/fallback) turn registered via observeServerTurn", () => {
+      transport.observeServerTurn("obs-1");
+      expect(transport.cancelActiveServerTurn()).toBe(true);
+      expect(socket.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel")?.id).toBe("obs-1");
+    });
+
+    it("does nothing after handleServerTurnCompleted clears the observed turn", () => {
+      transport.observeServerTurn("obs-1");
+      transport.handleServerTurnCompleted("obs-1");
+      expect(transport.cancelActiveServerTurn()).toBe(false);
+      expect(socket.lastSentOfType("cf_agent_chat_request_cancel")).toBeUndefined();
+    });
+
+    it("keeps a sent turn cancellable after a local-only abort (default)", async () => {
+      const ac = new AbortController();
+      const stream = await transport.sendMessages(sendMessagesArgs([userMessage("hi")], { abortSignal: ac.signal }));
+      const req = socket.lastSentOfType<{ id: string }>("cf_agent_use_chat_request")!;
+
+      const drainPromise = drainStream(stream);
+      ac.abort(); // local-only: errors the local stream, no cancel frame, turn stays tracked
+      await drainPromise;
+      expect(socket.lastSentOfType("cf_agent_chat_request_cancel")).toBeUndefined();
+
+      // The still-running server turn can be cancelled explicitly afterward.
+      expect(transport.cancelActiveServerTurn()).toBe(true);
+      expect(socket.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel")?.id).toBe(req.id);
+    });
+
+    it("cancels a transport-resumed turn (page-reload resume)", async () => {
+      const promise = transport.reconnectToStream({ chatId: "chat-1" });
+      await tick();
+      transport.handleStreamResuming({ type: "cf_agent_stream_resuming", id: "resumed-1" });
+      await promise;
+
+      expect(transport.cancelActiveServerTurn()).toBe(true);
+      expect(socket.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel")?.id).toBe("resumed-1");
+    });
+  });
+
+  // ── cancelOnClientAbort on attached streams (resume / tool continuation) ──
+
+  describe("cancelOnClientAbort on attached streams", () => {
+    it("a resumed stream sends a cancel frame on generic cancel when cancelOnClientAbort is true", async () => {
+      transport = new WebSocketChatTransport({ socket, cancelOnClientAbort: true });
+      const promise = transport.reconnectToStream({ chatId: "chat-1" });
+      await tick();
+      transport.handleStreamResuming({ type: "cf_agent_stream_resuming", id: "resumed-2" });
+      const stream = (await promise)!;
+
+      await stream.cancel();
+      expect(socket.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel")?.id).toBe("resumed-2");
+    });
+
+    it("a resumed stream does NOT send a cancel frame on generic cancel by default", async () => {
+      const promise = transport.reconnectToStream({ chatId: "chat-1" });
+      await tick();
+      transport.handleStreamResuming({ type: "cf_agent_stream_resuming", id: "resumed-3" });
+      const stream = (await promise)!;
+
+      await stream.cancel();
+      expect(socket.lastSentOfType("cf_agent_chat_request_cancel")).toBeUndefined();
+    });
+
+    it("a tool-continuation stream sends a cancel frame on generic cancel when cancelOnClientAbort is true", async () => {
+      transport = new WebSocketChatTransport({ socket, cancelOnClientAbort: true });
+      transport.expectToolContinuation();
+      const stream = (await transport.reconnectToStream({ chatId: "chat-1" }))!;
+      transport.handleStreamResuming({ type: "cf_agent_stream_resuming", id: "cont-x" });
+
+      await stream.cancel();
+      expect(socket.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel")?.id).toBe("cont-x");
+    });
+  });
+
+  // ── stream pending (pre-stream window) ──────────────────────────
+
+  describe("stream pending", () => {
+    it("handleStreamPending extends the resume probe past the 5s default", async () => {
+      vi.useFakeTimers();
+      const promise = transport.reconnectToStream({ chatId: "chat-1" });
+
+      expect(transport.handleStreamPending()).toBe(true);
+
+      // Past the original 5s probe — without the extension this would resolve null.
+      vi.advanceTimersByTime(5001);
+      transport.handleStreamResuming({ type: "cf_agent_stream_resuming", id: "late-1" });
+
+      const stream = await promise;
+      expect(stream).not.toBeNull();
+      expect(socket.lastSentOfType<{ id: string }>("cf_agent_stream_resume_ack")?.id).toBe("late-1");
+    });
+
+    it("the extended probe still times out to null at 60s", async () => {
+      vi.useFakeTimers();
+      const promise = transport.reconnectToStream({ chatId: "chat-1" });
+      transport.handleStreamPending();
+
+      vi.advanceTimersByTime(60_001);
+      expect(await promise).toBeNull();
+    });
+
+    it("handleStreamPending returns false when no resume probe is in flight", () => {
+      expect(transport.handleStreamPending()).toBe(false);
     });
   });
 

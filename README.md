@@ -6,7 +6,7 @@ Vue 3 composable for [Cloudflare Agents](https://github.com/cloudflare/agents) �
 
 ## Status
 
-v0.1 — covers the surface needed for a working chat UI: streaming responses, client-side tools, tool approvals, stream resumption, broadcast handling. Deeper upstream features (the `useAgent` connection hook, initial-message HTTP cache, `isServerStreaming` flag) are on the roadmap.
+Covers the surface needed for a working chat UI — streaming responses, client-side tools, tool approvals, stream resumption, broadcast handling — at parity with upstream `@cloudflare/ai-chat` 0.9.x on resume/recovery: resume dedupe, `isRecovering`, `cancelOnClientAbort`, pre-stream `cf_agent_stream_pending`, and `connectionError`. Deeper upstream features (the `useAgent` connection hook, initial-message HTTP cache, `isServerStreaming` / `isStreaming` flags) are on the roadmap.
 
 ## Install
 
@@ -21,7 +21,7 @@ Peer dependencies (must also be installed):
 | `vue` | `^3.3.4` |
 | `@ai-sdk/vue` | `^3.0.0` |
 | `ai` | `^6.0.0` |
-| `agents` | `>=0.11.0 <1.0.0` |
+| `agents` | `>=0.17.0 <1.0.0` |
 
 ## Usage
 
@@ -78,7 +78,9 @@ Returns:
 | `addToolOutput` | `function` | Submit a tool result. Sends `cf_agent_tool_result` and triggers continuation if enabled. |
 | `addToolApprovalResponse` | `function` | Resolve a human-in-the-loop tool approval. Sends `cf_agent_tool_approval` and triggers continuation. |
 | `clearHistory` | `function` | Clear local state and broadcast `cf_agent_chat_clear` to the server. |
-| `stop` | `function` | Abort the active stream and any pending tool continuation. |
+| `stop` | `function` | Abort the active stream and any pending tool continuation. Always cancels the server turn (explicit cancel). |
+| `isRecovering` | `Ref<boolean>` | Reactive — `true` while the server is recovering a durable chat turn (distinct from streaming, so a UI can show "recovering…"). Driven by `cf_agent_chat_recovering`. |
+| `connectionError` | `Ref<AgentConnectionError \| null>` | Reactive — the terminal WebSocket connection failure, or `null`. Cleared on reconnect. |
 
 ### Options
 
@@ -91,6 +93,7 @@ Returns:
 | `onToolCall` | `({ toolCall, addToolOutput }) => void \| Promise<void>` | — | Custom tool-call handler. Overrides per-tool `execute`. |
 | `autoContinueAfterToolResult` | `boolean` | `true` | Server resumes the stream after a tool result. |
 | `resume` | `boolean` | `true` | Resume in-flight streams on socket reconnect. |
+| `cancelOnClientAbort` | `boolean` | `false` | When `true`, a generic client-side abort cancels the server turn; when `false` (default) such aborts are local-only and the server turn keeps running and can resume. Explicit `stop()` always cancels. |
 | `onOpen` | `(event: Event) => void` | — | WebSocket open. |
 | `onClose` | `(event: CloseEvent) => void` | — | WebSocket close. |
 | `onSocketError` | `(event: Event) => void` | — | Connection-level error. |
@@ -157,6 +160,11 @@ const transport = new WebSocketChatTransport({
 | Partial-hydration replay rebuild | ✅ |
 | Broadcast handling (multi-tab) | ✅ |
 | Tool approval continuation merge across broadcasts | ✅ |
+| Resume dedupe (fallback-ACK at most once per socket) | ✅ |
+| `isRecovering` durable-recovery hint (`cf_agent_chat_recovering`) | ✅ |
+| `cancelOnClientAbort` (local-only abort, default) | ✅ |
+| Pre-stream `cf_agent_stream_pending` (extended resume probe) | ✅ |
+| `connectionError` (terminal WebSocket close) | ✅ |
 | `useAgent` connection hook | 🚧 roadmap |
 | Initial-message HTTP cache | 🚧 roadmap |
 | `isServerStreaming` / `isStreaming` flags | 🚧 roadmap |
@@ -166,7 +174,7 @@ const transport = new WebSocketChatTransport({
 ```bash
 pnpm install
 pnpm exec playwright install chromium
-pnpm test       # 59 tests in chromium (vitest-browser-vue)
+pnpm test       # 79 tests in chromium (vitest-browser-vue)
 pnpm typecheck
 pnpm lint
 pnpm build

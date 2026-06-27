@@ -32,6 +32,7 @@ vi.mock("agents/client", async () => {
 });
 
 import { useAgentChat, type UseAgentChatOptions } from "../use-agent-chat";
+import { WebSocketChatTransport } from "../web-socket-chat-transport";
 
 function latestClient(): MockClientLike {
   const last = registry.instances.at(-1);
@@ -1027,6 +1028,130 @@ describe("useAgentChat — tool approval continuations", () => {
 
     const textPart = assistants[0]!.parts.find((p) => p.type === "text") as { text?: string } | undefined;
     expect(textPart?.text).toBe("done");
+    unmount();
+  });
+});
+
+// ── resume fallback dedupe (0.8.5) ──────────────────────────────
+
+describe("useAgentChat — resume fallback dedupe", () => {
+  it("fallback-acks a repeated resuming offer for the same id at most once per socket", () => {
+    const { client, unmount } = mountChat();
+
+    // Server announces the same resume offer twice (onConnect + resume-request handler).
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "dup-1" });
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "dup-1" });
+
+    const acks = client
+      .sent<{ type: string; id: string }>()
+      .filter((m) => m.type === "cf_agent_stream_resume_ack" && m.id === "dup-1");
+    expect(acks).toHaveLength(1);
+    unmount();
+  });
+
+  it("acks again after the socket closes — a new connection needs a fresh replay", () => {
+    const { client, unmount } = mountChat();
+
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "dup-2" });
+    client.emit("close", new CloseEvent("close"));
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "dup-2" });
+
+    const acks = client
+      .sent<{ type: string; id: string }>()
+      .filter((m) => m.type === "cf_agent_stream_resume_ack" && m.id === "dup-2");
+    expect(acks).toHaveLength(2);
+    unmount();
+  });
+});
+
+// ── isRecovering (0.8.0) ────────────────────────────────────────
+
+describe("useAgentChat — isRecovering", () => {
+  it("sets isRecovering from cf_agent_chat_recovering and is NOT cleared by a message sync", () => {
+    const { chat, client, unmount } = mountChat();
+    expect(chat.isRecovering.value).toBe(false);
+
+    client.emitMessage({ type: "cf_agent_chat_recovering", recovering: true });
+    expect(chat.isRecovering.value).toBe(true);
+
+    // A connect-time full-message sync must NOT clear the recovery hint — otherwise the
+    // 0.9.0 replay-on-connect indicator would vanish the moment messages sync.
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: [userMessage("hi")] });
+    expect(chat.isRecovering.value).toBe(true);
+
+    client.emitMessage({ type: "cf_agent_chat_recovering", recovering: false });
+    expect(chat.isRecovering.value).toBe(false);
+    unmount();
+  });
+
+  it("clears isRecovering when a recovered turn starts streaming (resume ack)", () => {
+    const { chat, client, unmount } = mountChat();
+    client.emitMessage({ type: "cf_agent_chat_recovering", recovering: true });
+    expect(chat.isRecovering.value).toBe(true);
+
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rec-stream" });
+    expect(chat.isRecovering.value).toBe(false);
+    unmount();
+  });
+
+  it("clears isRecovering on chat clear", () => {
+    const { chat, client, unmount } = mountChat();
+    client.emitMessage({ type: "cf_agent_chat_recovering", recovering: true });
+    client.emitMessage({ type: "cf_agent_chat_clear" });
+    expect(chat.isRecovering.value).toBe(false);
+    unmount();
+  });
+});
+
+// ── connectionError (0.9.0) ─────────────────────────────────────
+
+describe("useAgentChat — connectionError", () => {
+  it("surfaces a terminal connection error and clears it on reconnect", async () => {
+    const { chat, client, unmount } = mountChat();
+    expect(chat.connectionError.value).toBeNull();
+
+    // AgentClient invokes onConnectionError on a terminal close; the hook composes one
+    // into the client options to mirror it into the reactive ref.
+    const opts = client.options as { onConnectionError?: (e: unknown) => void };
+    const err = new Error("terminal");
+    opts.onConnectionError?.(err);
+    expect(chat.connectionError.value).toBe(err);
+
+    client.emit("open", new Event("open"));
+    await tick();
+    expect(chat.connectionError.value).toBeNull();
+    unmount();
+  });
+});
+
+// ── stop cancels the server turn (0.7.0 explicit-cancel semantics) ──
+
+describe("useAgentChat — stop cancels the server turn", () => {
+  it("explicit stop() cancels an observed (resume-fallback) server turn", async () => {
+    const { chat, client, unmount } = mountChat();
+
+    // A broadcast/fallback resuming makes the turn observable + cancellable.
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "obs-turn" });
+    expect(client.lastSentOfType<{ id: string }>("cf_agent_stream_resume_ack")?.id).toBe("obs-turn");
+
+    await chat.stop();
+
+    expect(client.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel")?.id).toBe("obs-turn");
+    unmount();
+  });
+});
+
+// ── stream-pending forwarding (0.9.0) ───────────────────────────
+
+describe("useAgentChat — stream pending forwarding", () => {
+  it("forwards cf_agent_stream_pending to the transport", () => {
+    const spy = vi.spyOn(WebSocketChatTransport.prototype, "handleStreamPending");
+    const { client, unmount } = mountChat();
+
+    client.emitMessage({ type: "cf_agent_stream_pending" });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
     unmount();
   });
 });

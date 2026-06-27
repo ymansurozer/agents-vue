@@ -1,9 +1,9 @@
 import { Chat } from "@ai-sdk/vue";
 import { broadcastTransition } from "agents/chat";
 import type { BroadcastStreamState } from "agents/chat";
-import { AgentClient, type AgentClientOptions } from "agents/client";
+import { AgentClient, type AgentClientOptions, type AgentConnectionError } from "agents/client";
 import type { ChatOnToolCallCallback, JSONSchema7, Tool, UIMessage } from "ai";
-import { onScopeDispose } from "vue";
+import { onScopeDispose, ref } from "vue";
 
 import { WebSocketChatTransport } from "./web-socket-chat-transport";
 
@@ -53,6 +53,13 @@ export interface UseAgentChatOptions<
   autoContinueAfterToolResult?: boolean;
   /** When true (default), the chat resumes any in-flight stream on socket open. */
   resume?: boolean;
+  /**
+   * When true, a generic client-side abort (e.g. the AI SDK aborting the request on
+   * teardown) cancels the server turn. When false (default), such aborts are
+   * local-only — the server turn keeps running and can be resumed. Explicit `stop()`
+   * always cancels the server turn regardless. Matches upstream 0.7.0.
+   */
+  cancelOnClientAbort?: boolean;
   /** Called when the underlying WebSocket opens (initial connect or reconnect). */
   onOpen?: (event: Event) => void;
   /** Called when the underlying WebSocket closes. */
@@ -72,6 +79,7 @@ interface ProtocolMessage<ChatMessage extends UIMessage = UIMessage> {
   replay?: boolean;
   replayComplete?: boolean;
   continuation?: boolean;
+  recovering?: boolean;
   message?: ChatMessage;
   messages?: ChatMessage[];
 }
@@ -103,6 +111,7 @@ function parseProtocolMessage<ChatMessage extends UIMessage>(data: string): Prot
     replay: typeof parsed.replay === "boolean" ? parsed.replay : undefined,
     replayComplete: typeof parsed.replayComplete === "boolean" ? parsed.replayComplete : undefined,
     continuation: typeof parsed.continuation === "boolean" ? parsed.continuation : undefined,
+    recovering: typeof parsed.recovering === "boolean" ? parsed.recovering : undefined,
     message,
     messages,
   };
@@ -249,16 +258,35 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
 ) {
   const autoContinueAfterToolResult = options.autoContinueAfterToolResult ?? true;
   const activeRequestIds = new Set<string>();
+  // Resume offers this socket already fallback-ACKed. The server can announce
+  // cf_agent_stream_resuming for the same id twice (onConnect + resume-request),
+  // and ACKing both replays the chunk buffer twice → duplicated assistant text.
+  // ACK each at most once per socket; reset on close/dispose. Matches upstream 0.8.5.
+  const fallbackAckedResumeRequestIds = new Set<string>();
   let streamState: BroadcastStreamState = { status: "idle" };
   let isResumingToolContinuation = false;
 
+  /** True while the server is recovering a durable chat turn (distinct from streaming). */
+  const isRecovering = ref(false);
+  /** Terminal WebSocket connection failure, or null. Mirrors AgentClient.connectionError. */
+  const connectionError = ref<AgentConnectionError | null>(null);
+
   // AgentClient (PartySocket subclass) builds the websocket URL from the caller's
-  // config and exposes a typed RPC stub when AgentT is provided.
-  const socket = new AgentClient<AgentT, State>(options.client);
+  // config and exposes a typed RPC stub when AgentT is provided. Compose an
+  // onConnectionError that mirrors terminal failures into our reactive ref while
+  // still forwarding to a caller-supplied handler.
+  const socket = new AgentClient<AgentT, State>({
+    ...options.client,
+    onConnectionError: (error: AgentConnectionError) => {
+      connectionError.value = error;
+      options.client.onConnectionError?.(error);
+    },
+  });
 
   const transport = new WebSocketChatTransport({
     socket,
     activeRequestIds,
+    cancelOnClientAbort: options.cancelOnClientAbort ?? false,
     prepareBody: async () => {
       const rawBody = options.body;
       const extraBody = typeof rawBody === "function" ? await rawBody() : (rawBody ?? {});
@@ -313,6 +341,10 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
 
   async function stop() {
     try {
+      // Explicit stop always cancels the server turn (incl. a broadcast/observed one)
+      // before chat.stop() tears the local stream down. The generic abort that
+      // chat.stop() triggers then runs local-only (default) and won't double-cancel.
+      transport.cancelActiveServerTurn();
       await chat.stop();
     } finally {
       transport.abortActiveToolContinuation();
@@ -322,6 +354,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   function clearHistory() {
     void stop();
     isResumingToolContinuation = false;
+    isRecovering.value = false;
     streamState = broadcastTransition(streamState, { type: "clear" }).state;
     chat.messages = [];
     socket.send(JSON.stringify({ type: "cf_agent_chat_clear" }));
@@ -422,6 +455,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
         case "cf_agent_chat_clear":
           streamState = broadcastTransition(streamState, { type: "clear" }).state;
           chat.messages = [];
+          isRecovering.value = false;
           break;
 
         // Forward resume handshake to transport
@@ -429,18 +463,33 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
           if (
             data.id &&
             !transport.handleStreamResuming({ type: data.type, id: data.id }) &&
-            !activeRequestIds.has(data.id)
+            !activeRequestIds.has(data.id) &&
+            !fallbackAckedResumeRequestIds.has(data.id)
           ) {
             streamState = broadcastTransition(streamState, {
               type: "resume-fallback",
               streamId: data.id,
               messageId: createMessageId(),
             }).state;
+            // ACK this offer at most once per socket (else a duplicate offer replays the
+            // chunk buffer twice). Track the observed turn so an explicit stop() can cancel
+            // it, and clear the recovery hint now that a recovered turn is streaming live.
+            fallbackAckedResumeRequestIds.add(data.id);
+            transport.observeServerTurn(data.id);
+            isRecovering.value = false;
             socket.send(JSON.stringify({ type: "cf_agent_stream_resume_ack", id: data.id }));
           }
           break;
         case "cf_agent_stream_resume_none":
           transport.handleStreamResumeNone();
+          break;
+        // Pre-stream window (0.9.0): keep the in-flight resume probe waiting.
+        case "cf_agent_stream_pending":
+          transport.handleStreamPending();
+          break;
+        // Durable chat-recovery progress hint (0.8.0). Cleared on terminal/stream below.
+        case "cf_agent_chat_recovering":
+          isRecovering.value = Boolean(data.recovering);
           break;
         case "cf_agent_use_chat_response":
           if (!data.id || activeRequestIds.has(data.id)) {
@@ -468,6 +517,12 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
               // wire-tagged ChatMessage fields survive since transitions only touch base parts.
               chat.messages = result.messagesUpdate(chat.messages) as ChatMessage[];
             }
+
+            if (data.done) {
+              // A server/observed turn finished: clear the recovery hint and stop tracking it.
+              isRecovering.value = false;
+              transport.handleServerTurnCompleted(data.id);
+            }
           }
           break;
       }
@@ -480,12 +535,18 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   // behavior (so the project layer can observe the raw event), then run our own
   // logic (resume an in-progress stream on open, when not disabled).
   socket.addEventListener("open", (event: Event) => {
+    // A successful (re)connection clears any prior terminal connection error.
+    connectionError.value = null;
     options.onOpen?.(event);
     if (options.resume !== false) {
       void chat.resumeStream();
     }
   });
   socket.addEventListener("close", (event: Event) => {
+    // A new connection legitimately needs a fresh ACK + replay, and any in-progress
+    // recovery hint is stale once the socket drops.
+    fallbackAckedResumeRequestIds.clear();
+    isRecovering.value = false;
     // PartySocket dispatches CloseEvent here; widen narrowly for the callback.
     if (options.onClose && event instanceof CloseEvent) {
       options.onClose(event);
@@ -497,6 +558,8 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
 
   // Cleanup on scope disposal
   onScopeDispose(() => {
+    fallbackAckedResumeRequestIds.clear();
+    isRecovering.value = false;
     socket.close();
   });
 
@@ -507,5 +570,9 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     chat,
     socket,
     stop,
+    /** Reactive: true while the server is recovering a durable chat turn. */
+    isRecovering,
+    /** Reactive: terminal WebSocket connection failure, or null. */
+    connectionError,
   };
 }

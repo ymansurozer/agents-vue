@@ -19,11 +19,29 @@ export interface WebSocketChatTransportOptions {
     trigger: "submit-message" | "regenerate-message";
     messageId?: string;
   }) => Record<string, unknown> | Promise<Record<string, unknown>>;
+  /**
+   * Whether a generic client-side abort (e.g. the AI SDK aborting the request
+   * signal, or the stream being cancelled on teardown) should cancel the
+   * *server* turn. Local-only by default — the server turn keeps running and can
+   * be resumed/observed. Explicit `stop()` always cancels via
+   * `cancelActiveServerTurn()`, regardless of this flag. Matches upstream 0.7.0.
+   * @default false
+   */
+  cancelOnClientAbort?: boolean;
 }
 
 function randomRequestId(): string {
   return Math.random().toString(36).slice(2, 10);
 }
+
+/** Resume probe timeout (no pre-stream signal): give up and report "no stream". */
+const RESUME_PROBE_TIMEOUT_MS = 5000;
+/**
+ * Extended probe timeout once the server signals `cf_agent_stream_pending` — the
+ * turn is accepted but pre-stream (queueing / MCP setup), so keep waiting instead
+ * of resolving "no stream" mid pre-stream window. Matches upstream 0.9.0.
+ */
+const RESUME_PENDING_TIMEOUT_MS = 60_000;
 
 /**
  * ChatTransport that communicates with a Cloudflare Agent over WebSocket.
@@ -45,10 +63,23 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
   private _expectToolContinuation = false;
   private _abortToolContinuation: (() => boolean) | null = null;
 
+  // Whether a generic client abort should cancel the server turn (default: local-only).
+  private cancelOnClientAbort: boolean;
+
+  // The currently cancellable server turn — either locally initiated (sendMessages)
+  // or observed via the broadcast/resume-fallback path. `_cancelAttachedStream` tears
+  // down the local stream attached to a locally-initiated turn (null for observed turns).
+  private _activeServerTurnId: string | null = null;
+  private _cancelAttachedStream: (() => void) | null = null;
+
+  // Pre-stream "pending" extender for the in-flight resume probe (cleared on resolve).
+  private _onStreamPending: (() => void) | null = null;
+
   constructor(options: WebSocketChatTransportOptions) {
     this.socket = options.socket;
     this.prepareBody = options.prepareBody;
     this.activeRequestIds = options.activeRequestIds ?? new Set();
+    this.cancelOnClientAbort = options.cancelOnClientAbort ?? false;
   }
 
   /** Mark that the next reconnectToStream() should attach to a server-initiated tool continuation. */
@@ -59,6 +90,63 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
   /** Abort the active client-side tool continuation stream. */
   abortActiveToolContinuation(): boolean {
     return this._abortToolContinuation?.() ?? false;
+  }
+
+  /** Send a server-turn cancel frame for a request id (best-effort). */
+  private sendCancelFrame(id: string): void {
+    try {
+      this.socket.send(JSON.stringify({ id, type: "cf_agent_chat_request_cancel" }));
+    } catch {
+      // swallow
+    }
+  }
+
+  private setActiveServerTurn(id: string, cancelStream: (() => void) | null): void {
+    this._activeServerTurnId = id;
+    this._cancelAttachedStream = cancelStream;
+  }
+
+  private clearActiveServerTurn(id: string): void {
+    if (this._activeServerTurnId === id) {
+      this._activeServerTurnId = null;
+      this._cancelAttachedStream = null;
+    }
+  }
+
+  /** Register a server-observed (broadcast / resume-fallback) turn as the cancellable one. */
+  observeServerTurn(requestId: string): void {
+    this.setActiveServerTurn(requestId, null);
+  }
+
+  /** Mark a server turn complete so it is no longer the cancellable turn. */
+  handleServerTurnCompleted(requestId: string): void {
+    this.clearActiveServerTurn(requestId);
+  }
+
+  /**
+   * Explicitly cancel the active server turn (and any tool continuation). Unlike a
+   * generic client abort, this always signals the server. Drives `useAgentChat.stop()`.
+   */
+  cancelActiveServerTurn(): boolean {
+    const id = this._activeServerTurnId;
+    let cancelledRequest = false;
+    if (id) {
+      this.sendCancelFrame(id);
+      this._cancelAttachedStream?.();
+      this.clearActiveServerTurn(id);
+      cancelledRequest = true;
+    }
+    const cancelledToolContinuation = this.abortActiveToolContinuation();
+    return cancelledRequest || cancelledToolContinuation;
+  }
+
+  /** Called by the composable on cf_agent_stream_pending — extend the in-flight resume probe. */
+  handleStreamPending(): boolean {
+    if (!this._onStreamPending) {
+      return false;
+    }
+    this._onStreamPending();
+    return true;
   }
 
   /** True when the transport is waiting for a resume handshake. */
@@ -122,11 +210,14 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
     const socket = this.socket;
     const activeIds = this.activeRequestIds;
 
-    const finish = (action: () => void, keepId = false): void => {
+    const finish = (action: () => void, keepId = false, clearServerTurn = true): void => {
       if (completed) {
         return;
       }
       completed = true;
+      if (clearServerTurn) {
+        this.clearActiveServerTurn(requestId);
+      }
       try {
         action();
       } catch {
@@ -141,18 +232,36 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
     const abortError = new Error("Aborted");
     abortError.name = "AbortError";
 
+    let requestSent = false;
     let streamController!: ReadableStreamDefaultController<UIMessageChunk>;
+
+    // Explicit cancellation (via cancelActiveServerTurn) tears the local stream down but
+    // keeps the id so late frames for the cancelled turn stay ignored; the cancel frame
+    // itself is sent by cancelActiveServerTurn.
+    const cancelActiveRequest = (): boolean => {
+      if (completed) {
+        return false;
+      }
+      finish(() => streamController.error(abortError), true);
+      return true;
+    };
 
     const onAbort = (): void => {
       if (completed) {
         return;
       }
-      try {
-        socket.send(JSON.stringify({ id: requestId, type: "cf_agent_chat_request_cancel" }));
-      } catch {
-        // swallow
+      if (this.cancelOnClientAbort) {
+        // Generic abort cancels the server turn only when opted in.
+        if (requestSent) {
+          this.sendCancelFrame(requestId);
+        }
+        finish(() => streamController.error(abortError), requestSent);
+      } else {
+        // Local-only (default): drop our local id so the still-running server turn becomes
+        // observable via broadcast, but keep it tracked (once sent) so an explicit stop()
+        // can still cancel it.
+        finish(() => streamController.error(abortError), false, !requestSent);
       }
-      finish(() => streamController.error(abortError), true);
     };
 
     const stream = new ReadableStream<UIMessageChunk>({
@@ -193,6 +302,10 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
       },
     });
 
+    // Register this turn as the cancellable one before wiring abort, so a pre-send abort
+    // clears it (clearServerTurn = !requestSent) and a post-send abort keeps it tracked.
+    this.setActiveServerTurn(requestId, cancelActiveRequest);
+
     if (options.abortSignal) {
       options.abortSignal.addEventListener("abort", onAbort, { once: true });
       if (options.abortSignal.aborted) {
@@ -200,13 +313,16 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
       }
     }
 
-    socket.send(
-      JSON.stringify({
-        id: requestId,
-        init: { method: "POST", body: bodyPayload },
-        type: "cf_agent_use_chat_request",
-      }),
-    );
+    if (!completed) {
+      socket.send(
+        JSON.stringify({
+          id: requestId,
+          init: { method: "POST", body: bodyPayload },
+          type: "cf_agent_use_chat_request",
+        }),
+      );
+      requestSent = true;
+    }
 
     return stream;
   }
@@ -223,6 +339,7 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
 
     return new Promise((resolve) => {
       let resolved = false;
+      let timeout: ReturnType<typeof setTimeout>;
 
       const done = (value: ReadableStream<UIMessageChunk> | null): void => {
         if (resolved) {
@@ -231,6 +348,7 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
         resolved = true;
         this._resumeResolver = null;
         this._resumeNoneResolver = null;
+        this._onStreamPending = null;
         clearTimeout(timeout);
         resolve(value);
       };
@@ -242,6 +360,15 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
         this.socket.send(JSON.stringify({ type: "cf_agent_stream_resume_ack", id }));
         done(this._createResumeStream(id));
       };
+      // Pre-stream window: server accepted a turn but hasn't started streaming yet.
+      // Extend the probe so it doesn't resolve "no stream" early.
+      this._onStreamPending = () => {
+        if (resolved) {
+          return;
+        }
+        clearTimeout(timeout);
+        timeout = setTimeout(() => done(null), RESUME_PENDING_TIMEOUT_MS);
+      };
 
       try {
         this.socket.send(JSON.stringify({ type: "cf_agent_stream_resume_request" }));
@@ -249,7 +376,7 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
         // swallow
       }
 
-      const timeout = setTimeout(() => done(null), 5000);
+      timeout = setTimeout(() => done(null), RESUME_PROBE_TIMEOUT_MS);
     });
   }
 
@@ -299,6 +426,7 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
       }
       completed = true;
       this._abortToolContinuation = null;
+      this._onStreamPending = null;
       clearHandshakeResolvers(resumeResolver, resumeNoneResolver);
       try {
         action();
@@ -344,13 +472,28 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
           requestId = data.id;
           activeIds.add(requestId);
           clearHandshakeResolvers(onResume, onResumeNone);
+          this._onStreamPending = null;
           clearTimeout(timeout);
           socket.send(JSON.stringify({ type: "cf_agent_stream_resume_ack", id: requestId }));
         };
 
         onResumeRef = onResume;
         onResumeNoneRef = onResumeNone;
-        const timeout = setTimeout(() => finish(() => controller.close(), onResume, onResumeNone), 5000);
+        let timeout = setTimeout(
+          () => finish(() => controller.close(), onResume, onResumeNone),
+          RESUME_PROBE_TIMEOUT_MS,
+        );
+        // Pre-stream window: extend the probe when the server signals pending.
+        this._onStreamPending = () => {
+          if (completed) {
+            return;
+          }
+          clearTimeout(timeout);
+          timeout = setTimeout(
+            () => finish(() => controller.close(), onResume, onResumeNone),
+            RESUME_PENDING_TIMEOUT_MS,
+          );
+        };
 
         this._resumeResolver = onResume;
         this._resumeNoneResolver = onResumeNone;
@@ -388,8 +531,15 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
           finish(() => controller.close());
         }
       },
-      cancel() {
-        finish(() => {});
+      cancel: () => {
+        // Generic cancel: local-only unless cancelOnClientAbort opts into cancelling the
+        // server-side continuation turn.
+        if (requestId && this.cancelOnClientAbort) {
+          this.sendCancelFrame(requestId);
+          finish(() => {}, onResumeRef, onResumeNoneRef, true);
+        } else {
+          finish(() => {}, onResumeRef, onResumeNoneRef);
+        }
       },
     });
   }
@@ -399,24 +549,33 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
     const socket = this.socket;
     const activeIds = this.activeRequestIds;
     const chunkAbort = new AbortController();
+    const abortError = new Error("Aborted");
+    abortError.name = "AbortError";
     let completed = false;
+    let streamController!: ReadableStreamDefaultController<UIMessageChunk>;
 
-    const finish = (action: () => void): void => {
+    const finish = (action: () => void, keepId = false, clearServerTurn = true): void => {
       if (completed) {
         return;
       }
       completed = true;
+      if (clearServerTurn) {
+        this.clearActiveServerTurn(requestId);
+      }
       try {
         action();
       } catch {
         // swallow
       }
-      activeIds.delete(requestId);
+      if (!keepId) {
+        activeIds.delete(requestId);
+      }
       chunkAbort.abort();
     };
 
-    return new ReadableStream<UIMessageChunk>({
+    const stream = new ReadableStream<UIMessageChunk>({
       start(controller) {
+        streamController = controller;
         const onMessage = (event: MessageEvent): void => {
           try {
             const data = JSON.parse(String(event.data));
@@ -447,9 +606,28 @@ export class WebSocketChatTransport implements ChatTransport<UIMessage> {
         };
         socket.addEventListener("message", onMessage, { signal: chunkAbort.signal });
       },
-      cancel() {
-        finish(() => {});
+      cancel: () => {
+        // Generic cancel: local-only unless cancelOnClientAbort opts into cancelling the
+        // server-side resumed turn.
+        if (this.cancelOnClientAbort) {
+          this.sendCancelFrame(requestId);
+          finish(() => {}, true);
+        } else {
+          finish(() => {}, false, false);
+        }
       },
     });
+
+    // The resumed turn is the cancellable one; explicit cancel tears the local stream down
+    // and keeps the id (late frames ignored). cancelActiveServerTurn sends the frame.
+    this.setActiveServerTurn(requestId, () => {
+      if (completed) {
+        return false;
+      }
+      finish(() => streamController.error(abortError), true);
+      return true;
+    });
+
+    return stream;
   }
 }
