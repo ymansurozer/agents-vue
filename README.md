@@ -165,6 +165,7 @@ const transport = new WebSocketChatTransport({
 | `cancelOnClientAbort` (local-only abort, default) | ✅ |
 | Pre-stream `cf_agent_stream_pending` (extended resume probe) | ✅ |
 | `connectionError` (terminal WebSocket close) | ✅ |
+| Reconnect resume serialization (in-flight gate, `agents` 0.17.2 / #1837) | ✅ |
 | `useAgent` connection hook | 🚧 roadmap |
 | Initial-message HTTP cache | 🚧 roadmap |
 | `isServerStreaming` / `isStreaming` flags | 🚧 roadmap |
@@ -174,7 +175,7 @@ const transport = new WebSocketChatTransport({
 ```bash
 pnpm install
 pnpm exec playwright install chromium
-pnpm test       # 79 tests in chromium (vitest-browser-vue)
+pnpm test       # 80 tests in chromium (vitest-browser-vue)
 pnpm typecheck
 pnpm lint
 pnpm build

@@ -265,6 +265,13 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   const fallbackAckedResumeRequestIds = new Set<string>();
   let streamState: BroadcastStreamState = { status: "idle" };
   let isResumingToolContinuation = false;
+  // Serialize reconnect resume re-probes (#1837, upstream agents 0.17.2). The AI SDK's
+  // Chat.makeRequest shares one mutable activeResponse with no concurrency guard, so a
+  // second resumeStream() issued while the first is still in flight (reconnect storm)
+  // overwrites+clears it before the first finalizer runs → a crash. Gate on an in-flight
+  // flag; a generation counter lets teardown invalidate an orphaned late finalizer.
+  let resumeInFlight = false;
+  let resumeGeneration = 0;
 
   /** True while the server is recovering a durable chat turn (distinct from streaming). */
   const isRecovering = ref(false);
@@ -538,8 +545,23 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     // A successful (re)connection clears any prior terminal connection error.
     connectionError.value = null;
     options.onOpen?.(event);
-    if (options.resume !== false) {
-      void chat.resumeStream();
+    // Re-probe the stream on open, but never overlap resume calls (#1837): skip if a
+    // resume is already in flight, a tool continuation is resuming, or the transport is
+    // mid resume-handshake. The gate is cleared by the in-flight resume's own finalizer.
+    if (options.resume !== false && !resumeInFlight && !isResumingToolContinuation && !transport.isAwaitingResume()) {
+      resumeInFlight = true;
+      const myGeneration = resumeGeneration;
+      void chat
+        .resumeStream()
+        .catch(() => {})
+        .finally(() => {
+          // A teardown between issue and settle bumps the generation; ignore that stale
+          // finalizer so it can't reopen the gate on a disposed instance.
+          if (resumeGeneration !== myGeneration) {
+            return;
+          }
+          resumeInFlight = false;
+        });
     }
   });
   socket.addEventListener("close", (event: Event) => {
@@ -560,6 +582,10 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   onScopeDispose(() => {
     fallbackAckedResumeRequestIds.clear();
     isRecovering.value = false;
+    // Force the resume gate open and bump the generation so any orphaned in-flight
+    // resume's late finalizer is ignored rather than reopening the gate (#1837).
+    resumeGeneration++;
+    resumeInFlight = false;
     socket.close();
   });
 

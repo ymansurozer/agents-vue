@@ -1064,6 +1064,44 @@ describe("useAgentChat — resume fallback dedupe", () => {
   });
 });
 
+// ── reconnect resume serialization (#1837) ──────────────────────
+//
+// Upstream agents 0.17.2 (#1837): the AI SDK's Chat.makeRequest shares one mutable
+// activeResponse with no concurrency guard, so overlapping resume re-probes during a
+// reconnect storm crash the first resume's finalizer. The open handler must serialize
+// resumes — never issue a second resumeStream() while one is still in flight — and
+// reopen the gate once the in-flight resume settles.
+
+describe("useAgentChat — reconnect resume serialization (#1837)", () => {
+  it("suppresses a second resume re-probe while one is in flight, then resumes again after it settles", async () => {
+    const { chat, client, unmount } = mountChat({ onError: () => {} });
+
+    // Keep the first re-probe pending so the in-flight gate stays closed, and observe
+    // how many resumeStream() calls the open handler issues.
+    let settleResume!: () => void;
+    const inFlight = new Promise<void>((resolve) => {
+      settleResume = resolve;
+    });
+    const resumeStream = vi.spyOn(chat.chat, "resumeStream").mockImplementation(() => inFlight);
+
+    // Reconnect storm: two socket opens in succession while the first resume is pending.
+    client.emit("open", new Event("open"));
+    client.emit("open", new Event("open"));
+
+    // Only the first open re-probes; the second is suppressed by the in-flight gate.
+    expect(resumeStream).toHaveBeenCalledTimes(1);
+
+    // Once the in-flight resume settles, the gate reopens and a later open resumes again.
+    settleResume();
+    await tick();
+    client.emit("open", new Event("open"));
+    expect(resumeStream).toHaveBeenCalledTimes(2);
+
+    resumeStream.mockRestore();
+    unmount();
+  });
+});
+
 // ── isRecovering (0.8.0) ────────────────────────────────────────
 
 describe("useAgentChat — isRecovering", () => {
