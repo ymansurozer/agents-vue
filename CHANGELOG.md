@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.2.1
+
+[compare changes](https://github.com/ymansurozer/agents-vue/compare/v0.2.0...v0.2.1)
+
+### 🩹 Fixes
+
+- Serialize reconnect resume re-probes (parity with agents 0.17.2, #1837) ([#1837](https://github.com/ymansurozer/agents-vue/issues/1837))
+
+### ❤️ Contributors
+
+- Ymansurozer <ymansurozer@gmail.com>
+
 ## v0.2.0
 
 [compare changes](https://github.com/ymansurozer/agents-vue/compare/v0.1.0...v0.2.0)
