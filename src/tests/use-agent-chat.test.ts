@@ -1207,6 +1207,24 @@ describe("useAgentChat — stop cancels the server turn", () => {
     expect(client.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel")?.id).toBe("obs-turn");
     unmount();
   });
+
+  it("cancels a turn this tab only watched another tab start", async () => {
+    const { chat, client, unmount } = mountChat();
+
+    // No resuming announcement: the turn simply arrives as chunks, which is all a tab that was
+    // already connected when another one sent the question ever sees of it.
+    client.emitMessage({
+      type: "cf_agent_use_chat_response",
+      id: "other-tab-turn",
+      body: JSON.stringify({ type: "start" }),
+    });
+    await tick();
+
+    await chat.stop();
+
+    expect(client.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel")?.id).toBe("other-tab-turn");
+    unmount();
+  });
 });
 
 // ── stream-pending forwarding (0.9.0) ───────────────────────────

@@ -728,6 +728,13 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
           }
 
           {
+            // A turn another tab started is this tab's to stop too, since the state shows it Stop
+            // for it. `stop()` cancels only a turn the transport is tracking, and nothing else
+            // registers one this tab only watches.
+            if (!data.done && !data.error && transport.activeServerTurnId !== data.id) {
+              transport.observeServerTurn(data.id);
+            }
+
             const chunkData = data.body?.trim() ? JSON.parse(data.body) : undefined;
             const result = broadcastTransition(streamState, {
               type: "response",
@@ -750,7 +757,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
               chat.messages = result.messagesUpdate(chat.messages) as ChatMessage[];
             }
 
-            if (data.done) {
+            if (data.done || data.error) {
               // A server/observed turn finished: clear the recovery hint and stop tracking it.
               isRecovering.value = false;
               transport.handleServerTurnCompleted(data.id);
