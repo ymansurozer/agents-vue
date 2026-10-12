@@ -1,11 +1,39 @@
+/**
+ * Vue port of `@cloudflare/ai-chat/react`'s `useAgentChat`, because neither `agents` nor
+ * `@cloudflare/ai-chat` ships a Vue client — both expose only `./react`.
+ *
+ * The transport is upstream's: `WebSocketChatTransport` from `agents/chat/transport`, which the
+ * 0.2.x hand-rolled copy replaced. What lives here is the frame dispatcher the transport cannot
+ * live without (`agents/src/chat/ws-chat-transport.ts` — "resume coordination is provided by
+ * integrations such as useAgentChat"), plus the pieces React's hook keeps in state.
+ *
+ * What this hook does that the 0.2.x line did not:
+ * - the transport comes from `agents/chat/transport`; its option is `agent`, not `socket`
+ * - `retryPendingResume()` on socket open, so a handshake lost with the previous socket is
+ *   re-sent on the replacement instead of timing out
+ * - `setAgent()` exposed, which invalidates the transport's resume generation
+ * - `handleStreamResumeNone` takes the probe id, so a stale NONE cannot settle a newer probe
+ * - the initial `get-messages` fetch (React does this through `use()`; here it is an async seed)
+ * - `connectionState` and `connectionError`, from the socket's own open/close and its terminal
+ *   failures (PartySocket does the backing off; these only observe)
+ * - a replacement socket re-reads `get-messages` and merges it, because nothing pushes a snapshot
+ *   on connect and a turn that finished while this client was away is otherwise never seen
+ * - `onStateUpdate` forwarded to the `AgentClient`, which is where React's `useAgent` takes it
+ * - the four client-side bugs the Vue port carried, fixed against the React client: client-side
+ *   tool calls dispatched off the rendered transcript rather than off the SDK's own callback; the
+ *   early-continuation branch, so an announced continuation is observed or launched but never
+ *   both; the continuation armed before the tool frame is sent; and an unmatchable streaming tail
+ *   dropped rather than appended, with message ids minted without `Math.random`
+ *
+ * The cross-tab observer upstream's React hook carries is deliberately left out.
+ */
 import { Chat } from "@ai-sdk/vue";
 import { broadcastTransition } from "agents/chat";
 import type { BroadcastStreamState } from "agents/chat";
+import { WebSocketChatTransport } from "agents/chat/transport";
 import { AgentClient, type AgentClientOptions, type AgentConnectionError } from "agents/client";
-import type { ChatOnToolCallCallback, JSONSchema7, Tool, UIMessage } from "ai";
-import { onScopeDispose, ref } from "vue";
-
-import { WebSocketChatTransport } from "./web-socket-chat-transport";
+import { getToolName, isToolUIPart, type ChatStatus, type JSONSchema7, type Tool, type UIMessage } from "ai";
+import { onScopeDispose, ref, watch } from "vue";
 
 interface AgentClientTool<Input = unknown, Output = unknown> {
   description?: Tool["description"];
@@ -68,6 +96,35 @@ export interface UseAgentChatOptions<
   onSocketError?: (event: Event) => void;
   /** Called for chat-turn errors (AI SDK). */
   onError?: (error: Error) => void;
+  /**
+   * Called with every socket frame, parsed, **before** the chat protocol reads it. Return `true`
+   * to consume the frame, which stops the protocol handling below from seeing it at all.
+   *
+   * This is where an application's own frames belong. The protocol parser narrows a frame to the
+   * fields the chat protocol has and drops every other one, so a frame of your own would otherwise
+   * arrive with its contents removed.
+   */
+  onFrame?: (frame: unknown) => boolean | void;
+  /**
+   * How a transcript read back from the server is merged into the one on screen, used when a
+   * replacement socket re-reads `get-messages`.
+   *
+   * The read is a round trip of its own: it can be issued before a turn is persisted and land
+   * after the socket has already delivered the finished answer, so replacing the transcript with
+   * it wholesale would erase a reply that is on screen. The default merges by id with the stored
+   * copy winning and anything only on screen appended after; pass your own policy to decide
+   * differently — which copy of a message is fresher, say.
+   */
+  mergeMessages?: (onScreen: ChatMessage[], stored: ChatMessage[]) => ChatMessage[];
+  /**
+   * Called with the agent's state, on connect and on every change the server broadcasts.
+   *
+   * The same option the React hook passes to `useAgent`. It is forwarded to `AgentClient`, which
+   * owns the `cf_agent_state` frame; the dispatcher below never sees one. `source` is `"server"` for
+   * a broadcast and `"client"` for this client's own `setState` — which a server-owned state refuses,
+   * so nothing here sends one.
+   */
+  onStateUpdate?: (state: State, source: "server" | "client") => void;
 }
 
 interface ProtocolMessage<ChatMessage extends UIMessage = UIMessage> {
@@ -80,6 +137,8 @@ interface ProtocolMessage<ChatMessage extends UIMessage = UIMessage> {
   replayComplete?: boolean;
   continuation?: boolean;
   recovering?: boolean;
+  /** 0.23: which resume probe a STREAM_RESUME_NONE answers. */
+  probeId?: string;
   message?: ChatMessage;
   messages?: ChatMessage[];
 }
@@ -88,8 +147,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function parseProtocolMessage<ChatMessage extends UIMessage>(data: string): ProtocolMessage<ChatMessage> | null {
-  const parsed: unknown = JSON.parse(data);
+function parseProtocolMessage<ChatMessage extends UIMessage>(parsed: unknown): ProtocolMessage<ChatMessage> | null {
   if (!isRecord(parsed) || typeof parsed.type !== "string") {
     return null;
   }
@@ -112,6 +170,7 @@ function parseProtocolMessage<ChatMessage extends UIMessage>(data: string): Prot
     replayComplete: typeof parsed.replayComplete === "boolean" ? parsed.replayComplete : undefined,
     continuation: typeof parsed.continuation === "boolean" ? parsed.continuation : undefined,
     recovering: typeof parsed.recovering === "boolean" ? parsed.recovering : undefined,
+    probeId: typeof parsed.probeId === "string" ? parsed.probeId : undefined,
     message,
     messages,
   };
@@ -246,11 +305,37 @@ function preserveActiveStreamMessages<ChatMessage extends UIMessage>(
     }
   }
 
-  return [...incomingMessages, tailMessage];
+  // The tail belongs to no incoming message. Dropping the protection is what upstream does, and
+  // keeping it is a literal duplicate: the same turn, once under the id storage gave it and once
+  // under the id this client minted while it was streaming.
+  return incomingMessages;
+}
+
+/**
+ * The chat states a tool continuation may not launch during. The AI SDK keeps one mutable active
+ * response, so resuming while a request is in flight overwrites it; an errored chat has its
+ * continuation abandoned instead of launched.
+ */
+const CONTINUATION_BLOCKING_STATUSES = new Set<ChatStatus>(["submitted", "streaming", "error"]);
+
+/**
+ * The default {@link UseAgentChatOptions.mergeMessages}: match by id, the stored copy wins, and
+ * anything only on screen — a question typed while the socket was down — is kept after it.
+ */
+function mergeById<ChatMessage extends UIMessage>(onScreen: ChatMessage[], stored: ChatMessage[]): ChatMessage[] {
+  const storedIds = new Set(stored.map((message) => message.id));
+
+  return [...stored, ...onScreen.filter((message) => !storedIds.has(message.id))];
 }
 
 function createMessageId(): string {
-  return globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = UIMessage, State = StateOf<AgentT>>(
@@ -265,6 +350,13 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   const fallbackAckedResumeRequestIds = new Set<string>();
   let streamState: BroadcastStreamState = { status: "idle" };
   let isResumingToolContinuation = false;
+  /** Whether a continuation has been armed but not yet launched. */
+  let pendingToolContinuation = false;
+  let continuationLaunchTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The turn being watched in place of the continuation this client armed, or `null`. */
+  let observedToolContinuationRequestId: string | null = null;
+  /** Tool calls already handed to the caller, so a re-render or a re-sync cannot run one twice. */
+  const dispatchedToolCallIds = new Set<string>();
   // Serialize reconnect resume re-probes (#1837, upstream agents 0.17.2). The AI SDK's
   // Chat.makeRequest shares one mutable activeResponse with no concurrency guard, so a
   // second resumeStream() issued while the first is still in flight (reconnect storm)
@@ -277,6 +369,15 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   const isRecovering = ref(false);
   /** Terminal WebSocket connection failure, or null. Mirrors AgentClient.connectionError. */
   const connectionError = ref<AgentConnectionError | null>(null);
+  /**
+   * Whether the socket is up. PartySocket reconnects with its own backoff, so this only observes:
+   * it is set from the socket's open and close events and drives nothing.
+   */
+  const connectionState = ref<"connected" | "reconnecting">("connected");
+  /** Whether this socket is a replacement, and so owes the transcript a read from storage. */
+  let resyncPending = false;
+  /** Whether a turn this client is only watching is streaming. Gates the dispatch below. */
+  const isServerStreaming = ref(false);
 
   // AgentClient (PartySocket subclass) builds the websocket URL from the caller's
   // config and exposes a typed RPC stub when AgentT is provided. Compose an
@@ -288,10 +389,14 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
       connectionError.value = error;
       options.client.onConnectionError?.(error);
     },
+    onStateUpdate: (state: State, source: "server" | "client") => {
+      options.onStateUpdate?.(state, source);
+      options.client.onStateUpdate?.(state, source);
+    },
   });
 
-  const transport = new WebSocketChatTransport({
-    socket,
+  const transport = new WebSocketChatTransport<ChatMessage>({
+    agent: socket,
     activeRequestIds,
     cancelOnClientAbort: options.cancelOnClientAbort ?? false,
     prepareBody: async () => {
@@ -302,7 +407,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     },
   });
 
-  const handleToolCall: ChatOnToolCallCallback<ChatMessage> = async ({ toolCall }) => {
+  async function dispatchToolCall(toolCall: AgentToolCall) {
     const clientTool = options.tools?.[toolCall.toolName];
     const addClientToolOutput = (toolOutput: AgentToolOutput) => addToolOutputForTool(toolCall.toolName, toolOutput);
 
@@ -325,26 +430,103 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
         errorText: getErrorText(error),
       });
     }
-  };
+  }
 
   const chat = new Chat<ChatMessage>({
     messages: options.initialMessages,
     transport,
-    onToolCall: handleToolCall,
     onError: options.onError,
   });
 
-  function startToolContinuation() {
-    if (!autoContinueAfterToolResult || isResumingToolContinuation) {
+  /**
+   * Hands the caller every tool call the transcript is waiting on, whatever painted it.
+   *
+   * The AI SDK's own `onToolCall` fires only for a stream the SDK is reading, so a call in a turn
+   * this client merely observed — a resumed turn, a turn another tab started — would render as a
+   * chip and never run. Reading the rendered message instead makes dispatch independent of which
+   * path delivered the turn, and the id set is what keeps a re-render from running one twice.
+   */
+  function dispatchRenderedToolCalls() {
+    if (chat.status === "streaming" || chat.status === "submitted" || isServerStreaming.value || isRecovering.value) {
       return;
     }
 
-    isResumingToolContinuation = true;
-    transport.expectToolContinuation();
-    void chat.resumeStream().finally(() => {
-      isResumingToolContinuation = false;
-    });
+    const lastMessage = chat.messages.at(-1);
+    if (!lastMessage || lastMessage.role !== "assistant") {
+      return;
+    }
+
+    for (const part of lastMessage.parts) {
+      if (!isToolUIPart(part) || part.state !== "input-available" || dispatchedToolCallIds.has(part.toolCallId)) {
+        continue;
+      }
+
+      dispatchedToolCallIds.add(part.toolCallId);
+      void dispatchToolCall({ toolCallId: part.toolCallId, toolName: getToolName(part), input: part.input });
+    }
   }
+
+  /**
+   * Arms the continuation. Called **before** the tool frame is sent, never after: the server can
+   * announce the continuation before this client's launch runs, and the early branch in the frame
+   * dispatcher tells "the turn I was about to start" from "a turn that is not mine" by this flag.
+   */
+  function armToolContinuation(): boolean {
+    if (!autoContinueAfterToolResult || isResumingToolContinuation) {
+      return false;
+    }
+
+    isResumingToolContinuation = true;
+    pendingToolContinuation = true;
+    return true;
+  }
+
+  /** Launches an armed continuation on the next turn of the event loop, if it still wants one. */
+  function scheduleToolContinuationLaunch() {
+    if (
+      !pendingToolContinuation ||
+      continuationLaunchTimer !== null ||
+      CONTINUATION_BLOCKING_STATUSES.has(chat.status)
+    ) {
+      return;
+    }
+
+    continuationLaunchTimer = setTimeout(() => {
+      continuationLaunchTimer = null;
+
+      if (!pendingToolContinuation || CONTINUATION_BLOCKING_STATUSES.has(chat.status)) {
+        return;
+      }
+
+      pendingToolContinuation = false;
+      transport.expectToolContinuation();
+      void chat.resumeStream().finally(() => {
+        isResumingToolContinuation = false;
+      });
+    }, 0);
+  }
+
+  /** Forgets an armed continuation, whether it was launched, observed elsewhere, or abandoned. */
+  function resetToolContinuation() {
+    pendingToolContinuation = false;
+    isResumingToolContinuation = false;
+    observedToolContinuationRequestId = null;
+
+    if (continuationLaunchTimer !== null) {
+      clearTimeout(continuationLaunchTimer);
+      continuationLaunchTimer = null;
+    }
+  }
+
+  watch([() => chat.messages, () => chat.status, isServerStreaming, isRecovering], () => {
+    if (chat.status === "error" && pendingToolContinuation) {
+      resetToolContinuation();
+    } else {
+      scheduleToolContinuationLaunch();
+    }
+
+    dispatchRenderedToolCalls();
+  });
 
   async function stop() {
     try {
@@ -360,8 +542,9 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
 
   function clearHistory() {
     void stop();
-    isResumingToolContinuation = false;
+    resetToolContinuation();
     isRecovering.value = false;
+    isServerStreaming.value = false;
     streamState = broadcastTransition(streamState, { type: "clear" }).state;
     chat.messages = [];
     socket.send(JSON.stringify({ type: "cf_agent_chat_clear" }));
@@ -370,6 +553,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   async function addToolOutputForTool(toolName: string, toolOutput: AgentToolOutput) {
     const shouldAutoContinue = toolOutput.state === "output-error" ? false : autoContinueAfterToolResult;
     const clientTools = getClientToolSchemas(options.tools);
+    const continuing = shouldAutoContinue && armToolContinuation();
 
     socket.send(
       JSON.stringify({
@@ -399,8 +583,8 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
       });
     }
 
-    if (shouldAutoContinue) {
-      startToolContinuation();
+    if (continuing) {
+      scheduleToolContinuationLaunch();
     }
   }
 
@@ -421,6 +605,8 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
       return;
     }
 
+    const continuing = armToolContinuation();
+
     socket.send(
       JSON.stringify({
         type: "cf_agent_tool_approval",
@@ -431,13 +617,22 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     );
 
     await chat.addToolApprovalResponse(...args);
-    startToolContinuation();
+
+    if (continuing) {
+      scheduleToolContinuationLaunch();
+    }
   }
 
   // Handle incoming WebSocket messages for state synchronization
   socket.addEventListener("message", (event: MessageEvent) => {
     try {
-      const data = parseProtocolMessage<ChatMessage>(String(event.data));
+      const raw: unknown = JSON.parse(String(event.data));
+
+      if (options.onFrame?.(raw) === true) {
+        return;
+      }
+
+      const data = parseProtocolMessage<ChatMessage>(raw);
       if (!data) {
         return;
       }
@@ -463,21 +658,39 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
           streamState = broadcastTransition(streamState, { type: "clear" }).state;
           chat.messages = [];
           isRecovering.value = false;
+          isServerStreaming.value = false;
           break;
 
         // Forward resume handshake to transport
-        case "cf_agent_stream_resuming":
+        case "cf_agent_stream_resuming": {
+          // The turn this client armed a continuation for, announced before the launch could
+          // register its resolver. Observing it and launching anyway delivers the same turn
+          // twice, so the launch is abandoned here — one or the other, never both.
+          const isEarlyToolContinuation = isResumingToolContinuation && !transport.isAwaitingResume();
+
           if (
             data.id &&
-            !transport.handleStreamResuming({ type: data.type, id: data.id }) &&
+            !transport.handleStreamResuming({ id: data.id }) &&
             !activeRequestIds.has(data.id) &&
             !fallbackAckedResumeRequestIds.has(data.id)
           ) {
-            streamState = broadcastTransition(streamState, {
+            if (isEarlyToolContinuation) {
+              pendingToolContinuation = false;
+              observedToolContinuationRequestId = data.id;
+
+              if (continuationLaunchTimer !== null) {
+                clearTimeout(continuationLaunchTimer);
+                continuationLaunchTimer = null;
+              }
+            }
+
+            const resumed = broadcastTransition(streamState, {
               type: "resume-fallback",
               streamId: data.id,
               messageId: createMessageId(),
-            }).state;
+            });
+            streamState = resumed.state;
+            isServerStreaming.value = resumed.isStreaming;
             // ACK this offer at most once per socket (else a duplicate offer replays the
             // chunk buffer twice). Track the observed turn so an explicit stop() can cancel
             // it, and clear the recovery hint now that a recovered turn is streaming live.
@@ -487,8 +700,10 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
             socket.send(JSON.stringify({ type: "cf_agent_stream_resume_ack", id: data.id }));
           }
           break;
+        }
+        // 0.23 carries the probe id, so a NONE answering an older probe cannot settle this one.
         case "cf_agent_stream_resume_none":
-          transport.handleStreamResumeNone();
+          transport.handleStreamResumeNone({ probeId: data.probeId });
           break;
         // Pre-stream window (0.9.0): keep the in-flight resume probe waiting.
         case "cf_agent_stream_pending":
@@ -519,6 +734,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
             });
 
             streamState = result.state;
+            isServerStreaming.value = result.isStreaming;
             if (result.messagesUpdate) {
               // broadcastTransition typed messagesUpdate over base UIMessage; we trust
               // wire-tagged ChatMessage fields survive since transitions only touch base parts.
@@ -529,6 +745,10 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
               // A server/observed turn finished: clear the recovery hint and stop tracking it.
               isRecovering.value = false;
               transport.handleServerTurnCompleted(data.id);
+
+              if (observedToolContinuationRequestId === data.id) {
+                resetToolContinuation();
+              }
             }
           }
           break;
@@ -544,7 +764,23 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   socket.addEventListener("open", (event: Event) => {
     // A successful (re)connection clears any prior terminal connection error.
     connectionError.value = null;
+    connectionState.value = "connected";
     options.onOpen?.(event);
+    // `socket.url` is empty until PartySocket has resolved its URL provider, so the seed cannot
+    // run at setup; the first open is the earliest point the HTTP twin of the socket URL exists.
+    void seedInitialMessages();
+
+    if (resyncPending) {
+      resyncPending = false;
+      void resyncMessages();
+    }
+    // 0.23 rebase: PartySocket replaces the underlying WebSocket on reconnect, so a handshake
+    // sent on the dead one was never answered. Retransmit it on the new socket rather than
+    // starting a second AI SDK resume operation — and if that succeeds, there is nothing left
+    // for the fresh-probe branch below to do.
+    if (transport.retryPendingResume()) {
+      return;
+    }
     // Re-probe the stream on open, but never overlap resume calls (#1837): skip if a
     // resume is already in flight, a tool continuation is resuming, or the transport is
     // mid resume-handshake. The gate is cleared by the in-flight resume's own finalizer.
@@ -569,6 +805,8 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     // recovery hint is stale once the socket drops.
     fallbackAckedResumeRequestIds.clear();
     isRecovering.value = false;
+    connectionState.value = "reconnecting";
+    resyncPending = true;
     // PartySocket dispatches CloseEvent here; widen narrowly for the callback.
     if (options.onClose && event instanceof CloseEvent) {
       options.onClose(event);
@@ -581,6 +819,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   // Cleanup on scope disposal
   onScopeDispose(() => {
     fallbackAckedResumeRequestIds.clear();
+    resetToolContinuation();
     isRecovering.value = false;
     // Force the resume gate open and bump the generation so any orphaned in-flight
     // resume's late finalizer is ignored rather than reopening the gate (#1837).
@@ -589,16 +828,83 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     socket.close();
   });
 
+  /**
+   * 0.23 rebase: point the transport at a different connection. `setAgent` invalidates the
+   * transport's resume generation, so a handshake owned by the old socket settles instead of
+   * leaking a resolver into the new one.
+   */
+  function setAgent(next: AgentClient<AgentT, State>) {
+    transport.setAgent(next);
+  }
+
+  /**
+   * 0.23 rebase: the initial transcript fetch the React hook does through `use()`. It is also what
+   * a reconnect reads, because nothing pushes a full snapshot on connect — `cf_agent_chat_messages`
+   * is broadcast by `persistMessages` and by nothing else, so a client that was away while a turn
+   * finished is never told, and would sit on its half-written partial until a reload.
+   */
+  const initialMessagesLoaded = ref(false);
+  let initialMessagesSeedStarted = options.initialMessages !== undefined;
+  initialMessagesLoaded.value = initialMessagesSeedStarted;
+
+  async function fetchStoredMessages(): Promise<ChatMessage[] | null> {
+    try {
+      const target = new URL(socket.url);
+      target.protocol = target.protocol === "wss:" ? "https:" : "http:";
+      target.searchParams.delete("_pk");
+      target.pathname += "/get-messages";
+      const response = await fetch(target.toString(), { credentials: "include" });
+      if (!response.ok) {
+        console.warn(`[agents-vue] get-messages failed: ${response.status} ${response.statusText}`);
+        return null;
+      }
+      const text = await response.text();
+      return text.trim() ? (JSON.parse(text) as ChatMessage[]) : null;
+    } catch (error) {
+      console.warn("[agents-vue] get-messages errored", error);
+      return null;
+    }
+  }
+
+  async function seedInitialMessages() {
+    // Once per hook instance: a reconnect takes the resync path below instead.
+    if (initialMessagesSeedStarted) {
+      return;
+    }
+    initialMessagesSeedStarted = true;
+    try {
+      const stored = await fetchStoredMessages();
+      if (stored && chat.messages.length === 0) {
+        chat.messages = stored;
+      }
+    } finally {
+      initialMessagesLoaded.value = true;
+    }
+  }
+
+  /** What a reconnect reads, merged rather than taken wholesale. See the `mergeMessages` option. */
+  async function resyncMessages() {
+    const stored = await fetchStoredMessages();
+
+    if (stored) {
+      chat.messages = (options.mergeMessages ?? mergeById)(chat.messages, stored);
+    }
+  }
   return {
     addToolApprovalResponse,
     addToolOutput,
     clearHistory,
     chat,
     socket,
+    setAgent,
     stop,
+    /** Reactive: true once the `get-messages` seed has settled (or was skipped). */
+    initialMessagesLoaded,
     /** Reactive: true while the server is recovering a durable chat turn. */
     isRecovering,
     /** Reactive: terminal WebSocket connection failure, or null. */
     connectionError,
+    /** Reactive: whether the socket is up, for the header's "Reconnecting…". */
+    connectionState,
   };
 }

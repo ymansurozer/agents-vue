@@ -6,7 +6,9 @@ Vue 3 composable for [Cloudflare Agents](https://github.com/cloudflare/agents) �
 
 ## Status
 
-Covers the surface needed for a working chat UI — streaming responses, client-side tools, tool approvals, stream resumption, broadcast handling — at parity with upstream `@cloudflare/ai-chat` 0.9.x on resume/recovery: resume dedupe, `isRecovering`, `cancelOnClientAbort`, pre-stream `cf_agent_stream_pending`, and `connectionError`. Deeper upstream features (the `useAgent` connection hook, initial-message HTTP cache, `isServerStreaming` / `isStreaming` flags) are on the roadmap.
+Covers the surface needed for a working chat UI — streaming responses, client-side tools, tool approvals, stream resumption, broadcast handling — at parity with upstream `@cloudflare/ai-chat` 0.12.x on resume/recovery: resume dedupe, `isRecovering`, `cancelOnClientAbort`, pre-stream `cf_agent_stream_pending`, and `connectionError`. Deeper upstream features (the `useAgent` connection hook, the cross-tab observer, `isServerStreaming` / `isStreaming` flags) are on the roadmap.
+
+0.3.0 moves the transport to upstream's own `WebSocketChatTransport` from `agents/chat/transport` and fixes four client-side bugs — see [CHANGELOG](./CHANGELOG.md).
 
 ## Install
 
@@ -18,10 +20,10 @@ Peer dependencies (must also be installed):
 
 | Peer | Version |
 |---|---|
-| `vue` | `^3.3.4` |
-| `@ai-sdk/vue` | `^3.0.0` |
-| `ai` | `^6.0.0` |
-| `agents` | `>=0.17.0 <1.0.0` |
+| `vue` | `^3.5.0` |
+| `@ai-sdk/vue` | `^4.0.0` |
+| `ai` | `^7.0.0` |
+| `agents` | `>=0.27.0 <1.0.0` |
 
 ## Usage
 
@@ -98,6 +100,41 @@ Returns:
 | `onClose` | `(event: CloseEvent) => void` | — | WebSocket close. |
 | `onSocketError` | `(event: Event) => void` | — | Connection-level error. |
 | `onError` | `(error: Error) => void` | — | Chat-turn error from the AI SDK. |
+| `onStateUpdate` | `(state: State, source: "server" \| "client") => void` | — | The agent's state, on connect and on every change the server broadcasts. |
+| `onFrame` | `(frame: unknown) => boolean \| void` | — | Every socket frame, parsed, **before** the chat protocol reads it. Return `true` to consume it. |
+| `mergeMessages` | `(onScreen, stored) => ChatMessage[]` | merge by id | How a reconnect's read of the stored transcript joins the one on screen. |
+
+### `onFrame` — your own frames
+
+The chat protocol parser narrows a frame to the fields `cf_agent_*` messages have and drops every
+other one, so a frame of your own would arrive with its contents removed. `onFrame` runs first and
+sees the frame whole; returning `true` consumes it, and the protocol handling never sees it.
+
+```ts
+useAgentChat({
+  client: { /* ... */ },
+  onFrame: (frame) => {
+    if (!isRecord(frame) || frame.type !== "my_app_event") return;
+    showBanner(frame);
+    return true; // consumed
+  },
+});
+```
+
+### `mergeMessages` — what a reconnect does to the transcript
+
+Nothing pushes a snapshot on connect, so a replacement socket re-reads the stored transcript — and
+that read is a round trip of its own: it can be issued before a turn is persisted and land after the
+socket has already delivered the finished answer. The default merges by id with the stored copy
+winning and anything only on screen kept after it. Pass your own policy to decide differently.
+
+```ts
+useAgentChat({
+  client: { /* ... */ },
+  // Keep whichever copy of a message has more text: the stored one may be behind the stream.
+  mergeMessages: (onScreen, stored) => stored.map((message) => fresher(message, byId(onScreen, message.id))),
+});
+```
 
 ### Client-side tools
 
@@ -133,25 +170,27 @@ The composable matches the approval id against a `tool-approve` part in `chat.me
 
 ### `WebSocketChatTransport`
 
-Exported for advanced use cases. The composable wires this internally; you only need it directly if you're building a non-`@ai-sdk/vue` flow over the same `cf_agent_*` wire protocol.
+No longer exported from here. Since 0.3.0 the composable wires upstream's own transport, so import
+it from `agents` directly if you are building a non-`@ai-sdk/vue` flow over the same `cf_agent_*`
+wire protocol:
 
 ```ts
-import { WebSocketChatTransport, type WebSocketLike } from "agents-vue";
+import { WebSocketChatTransport } from "agents/chat/transport";
 
 const transport = new WebSocketChatTransport({
-  socket,        // any WebSocketLike
+  agent,         // an AgentClient
   prepareBody,   // optional
 });
 ```
 
 ## Coverage vs upstream
 
-`agents-vue@0.1` covers the surface real apps use. Wire protocol is identical to upstream — same `cf_agent_*` message shapes, same resumable streaming, same broadcast transitions, same tool continuation flow.
+`agents-vue` covers the surface real apps use. Wire protocol is identical to upstream — same `cf_agent_*` message shapes, same resumable streaming, same broadcast transitions, same tool continuation flow.
 
 | Feature | Status |
 |---|---|
 | `useAgentChat` composable | ✅ |
-| `WebSocketChatTransport` | ✅ |
+| `WebSocketChatTransport` (upstream's, from `agents/chat/transport`) | ✅ |
 | Streaming responses | ✅ |
 | Client-side tools with `execute` | ✅ |
 | Tool approvals (HITL) | ✅ |
@@ -166,8 +205,16 @@ const transport = new WebSocketChatTransport({
 | Pre-stream `cf_agent_stream_pending` (extended resume probe) | ✅ |
 | `connectionError` (terminal WebSocket close) | ✅ |
 | Reconnect resume serialization (in-flight gate, `agents` 0.17.2 / #1837) | ✅ |
+| `setAgent()`, which invalidates the transport's resume generation | ✅ |
+| `connectionState`, from the socket's own open/close | ✅ |
+| `onStateUpdate`, forwarded to the `AgentClient` | ✅ |
+| Initial `get-messages` seed, and a re-read on a replacement socket | ✅ |
+| Client-side tool calls dispatched off the rendered transcript | ✅ |
+| Early-continuation branch (observe the announced turn, or launch — never both) | ✅ |
+| Continuation armed before the tool frame is sent | ✅ |
+| An unmatchable streaming tail dropped rather than appended | ✅ |
 | `useAgent` connection hook | 🚧 roadmap |
-| Initial-message HTTP cache | 🚧 roadmap |
+| Cross-tab observer | 🚧 roadmap |
 | `isServerStreaming` / `isStreaming` flags | 🚧 roadmap |
 
 ## Contributing
@@ -175,7 +222,7 @@ const transport = new WebSocketChatTransport({
 ```bash
 pnpm install
 pnpm exec playwright install chromium
-pnpm test       # 80 tests in chromium (vitest-browser-vue)
+pnpm test       # chromium (vitest-browser-vue)
 pnpm typecheck
 pnpm lint
 pnpm build

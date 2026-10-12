@@ -7,8 +7,3 @@
  */
 
 export { useAgentChat, type UseAgentChatOptions } from "./use-agent-chat";
-export {
-  WebSocketChatTransport,
-  type WebSocketChatTransportOptions,
-  type WebSocketLike,
-} from "./web-socket-chat-transport";

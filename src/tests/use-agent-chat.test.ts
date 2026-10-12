@@ -31,12 +31,15 @@ vi.mock("agents/client", async () => {
   };
 });
 
+import { WebSocketChatTransport } from "agents/chat/transport";
+
 import { useAgentChat, type UseAgentChatOptions } from "../use-agent-chat";
-import { WebSocketChatTransport } from "../web-socket-chat-transport";
 
 function latestClient(): MockClientLike {
   const last = registry.instances.at(-1);
-  if (!last) throw new Error("No mock AgentClient was constructed");
+  if (!last) {
+    throw new Error("No mock AgentClient was constructed");
+  }
   return last;
 }
 
@@ -261,7 +264,9 @@ describe("useAgentChat — body option", () => {
   async function flushRequest(client: MockClientLike): Promise<{ id: string; init: { body: string } }> {
     for (let i = 0; i < 5; i++) {
       const req = client.lastSentOfType<{ id: string; init: { body: string } }>("cf_agent_use_chat_request");
-      if (req) return req;
+      if (req) {
+        return req;
+      }
       await tick();
     }
     throw new Error("cf_agent_use_chat_request was not sent within 5 ticks");
@@ -321,7 +326,7 @@ describe("useAgentChat — body option", () => {
     void chat.chat.sendMessage({ text: "hi" });
     const req = await flushRequest(client);
 
-    const parsed = JSON.parse(req.init.body) as { clientTools?: { name: string }[]; tenant: string };
+    const parsed = JSON.parse(req.init.body) as { clientTools?: Array<{ name: string }>; tenant: string };
     expect(parsed.tenant).toBe("acme");
     expect(parsed.clientTools).toEqual([
       {
@@ -594,7 +599,9 @@ describe("useAgentChat — tool approval continuation", () => {
 describe("useAgentChat — stream resume handshake forwarding", () => {
   async function waitForResumeRequest(client: MockClientLike): Promise<void> {
     for (let i = 0; i < 8; i++) {
-      if (client.lastSentOfType("cf_agent_stream_resume_request")) return;
+      if (client.lastSentOfType("cf_agent_stream_resume_request")) {
+        return;
+      }
       await tick();
     }
     throw new Error("cf_agent_stream_resume_request was not sent within 8 ticks");
@@ -681,7 +688,7 @@ describe("useAgentChat — server-initiated stream", () => {
     unmount();
   });
 
-  it("preserveActiveStreamMessages keeps an active streaming assistant on broadcast", () => {
+  it("keeps a streaming assistant the broadcast also carries", () => {
     const tail = assistantMessage("streaming…", "a-active");
     const { chat, client, unmount } = mountChat({
       initialMessages: [userMessage("hi", "u1"), tail],
@@ -690,14 +697,32 @@ describe("useAgentChat — server-initiated stream", () => {
     // Put streamState non-idle by announcing a new server stream.
     client.emitMessage({ type: "cf_agent_stream_resuming", id: "stream-99" });
 
-    // Broadcast arrives but doesn't include the active assistant.
+    // The broadcast holds the same assistant, as storage knows it: half-written.
+    client.emitMessage({
+      type: "cf_agent_chat_messages",
+      messages: [userMessage("hi", "u1"), assistantMessage("stream", "a-active")],
+    });
+
+    // The live copy wins for that id — it is the one with the newer bytes.
+    expect(chat.chat.messages.at(-1)).toEqual(tail);
+    unmount();
+  });
+
+  it("drops a streaming assistant the broadcast cannot account for", () => {
+    const { chat, client, unmount } = mountChat({
+      initialMessages: [userMessage("hi", "u1"), assistantMessage("streaming…", "a-active")],
+    });
+
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "stream-99" });
+
+    // Nothing in the broadcast matches the tail, by id or by tool call. Keeping it would put the
+    // same turn on screen twice — once as storage knows it, once as this client minted it.
     client.emitMessage({
       type: "cf_agent_chat_messages",
       messages: [userMessage("hi", "u1")],
     });
 
-    // The streaming assistant should be preserved at the tail.
-    expect(chat.chat.messages.at(-1)?.id).toBe("a-active");
+    expect(chat.chat.messages).toEqual([userMessage("hi", "u1")]);
     unmount();
   });
 
@@ -776,7 +801,9 @@ describe("useAgentChat — client-stream interaction", () => {
   async function waitForChatRequest(client: MockClientLike): Promise<{ id: string }> {
     for (let i = 0; i < 8; i++) {
       const req = client.lastSentOfType<{ id: string }>("cf_agent_use_chat_request");
-      if (req) return req;
+      if (req) {
+        return req;
+      }
       await tick();
     }
     throw new Error("cf_agent_use_chat_request was not sent within 8 ticks");
@@ -801,25 +828,23 @@ describe("useAgentChat — client-stream interaction", () => {
     });
     await tick();
 
-    const lengthBeforeBroadcast = chat.chat.messages.length;
+    const streamingAssistantId = chat.chat.messages.at(-1)?.id;
 
-    // Server broadcast arrives mid-stream with only the user message.
+    // The broadcast arrives mid-stream carrying the same assistant, as storage has it so far.
     client.emitMessage({
       type: "cf_agent_chat_messages",
-      messages: [userMessage("hi", "u1")],
+      messages: [userMessage("hi", "u1"), assistantMessage("", streamingAssistantId)],
     });
 
-    // The assistant message in flight should not be lost — preserveActiveStreamMessages
-    // keeps it appended. Length should be at least what we had before (user + streaming
-    // assistant), not collapsed back to just the broadcast.
-    expect(chat.chat.messages.length).toBeGreaterThanOrEqual(lengthBeforeBroadcast);
-    expect(chat.chat.messages.at(-1)?.role).toBe("assistant");
+    // The bytes already on screen are kept for that message: the broadcast is behind the stream.
+    expect(chat.chat.messages.at(-1)?.id).toBe(streamingAssistantId);
+    expect(JSON.stringify(chat.chat.messages.at(-1)?.parts)).toContain("streaming");
 
     unmount();
   });
 
-  it("onToolCall fires when a tool input-available chunk lands on a client stream", async () => {
-    const calls: { toolCallId: string; toolName: string }[] = [];
+  it("fires onToolCall for a call a client stream painted, once the turn settles", async () => {
+    const calls: Array<{ toolCallId: string; toolName: string }> = [];
     const { chat, client, unmount } = mountChat({
       onToolCall: ({ toolCall }) => {
         calls.push({ toolCallId: toolCall.toolCallId, toolName: toolCall.toolName });
@@ -841,9 +866,14 @@ describe("useAgentChat — client-stream interaction", () => {
         input: { x: 1 },
       }),
     });
-    // Drain microtasks for Chat to dispatch onToolCall.
+    // The call is dispatched off the rendered transcript, which is read once the turn is no
+    // longer streaming — the same point React's hook dispatches from.
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: req.id, body: "", done: true });
+    // Drain microtasks for the watcher to run.
     for (let i = 0; i < 8; i++) {
-      if (calls.length > 0) break;
+      if (calls.length > 0) {
+        break;
+      }
       await tick();
     }
 
@@ -901,7 +931,7 @@ describe("useAgentChat — stream resumption / partial hydration", () => {
     expect(chat.chat.messages).toHaveLength(2);
     const assistant = chat.chat.messages.find((m) => m.role === "assistant");
     expect(assistant).toBeDefined();
-    const textParts = assistant!.parts.filter((p) => p.type === "text") as { text: string }[];
+    const textParts = assistant!.parts.filter((p) => p.type === "text") as Array<{ text: string }>;
     expect(textParts).toHaveLength(1);
     expect(textParts[0]!.text).toBe("Once upon");
 
@@ -914,7 +944,7 @@ describe("useAgentChat — stream resumption / partial hydration", () => {
     await tick();
 
     const assistantAfter = chat.chat.messages.find((m) => m.role === "assistant")!;
-    const textPartsAfter = assistantAfter.parts.filter((p) => p.type === "text") as { text: string }[];
+    const textPartsAfter = assistantAfter.parts.filter((p) => p.type === "text") as Array<{ text: string }>;
     expect(textPartsAfter).toHaveLength(1);
     expect(textPartsAfter[0]!.text).toBe("Once upon a time");
 
@@ -1190,6 +1220,182 @@ describe("useAgentChat — stream pending forwarding", () => {
 
     expect(spy).toHaveBeenCalledTimes(1);
     spy.mockRestore();
+    unmount();
+  });
+});
+
+// ── client-side tool dispatch, off the rendered transcript ───────
+
+describe("useAgentChat — dispatching client-side tool calls", () => {
+  const toolCallChunk = (toolCallId: string) =>
+    JSON.stringify({ type: "tool-input-available", toolCallId, toolName: "echo", input: { x: 1 } });
+
+  /** A turn the server owns, from its announcement to its last chunk. */
+  function observeTurn(client: MockSocket, streamId: string, toolCallId?: string) {
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: streamId });
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: streamId, body: JSON.stringify({ type: "start" }) });
+    if (toolCallId) {
+      client.emitMessage({ type: "cf_agent_use_chat_response", id: streamId, body: toolCallChunk(toolCallId) });
+    }
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: streamId, body: "", done: true });
+  }
+
+  it("runs a call painted by a turn this client only observed", async () => {
+    const calls: string[] = [];
+    const { chat, client, unmount } = mountChat({
+      onToolCall: ({ toolCall }) => {
+        calls.push(toolCall.toolCallId);
+      },
+    });
+
+    observeTurn(client, "obs-1", "tc-1");
+    await tick();
+
+    expect(calls).toEqual(["tc-1"]);
+    expect(chat.chat.messages).toHaveLength(1);
+    unmount();
+  });
+
+  it("runs both calls of a page that saw two turns", async () => {
+    const calls: string[] = [];
+    const { client, unmount } = mountChat({
+      onToolCall: ({ toolCall }) => {
+        calls.push(toolCall.toolCallId);
+      },
+    });
+
+    observeTurn(client, "obs-a", "tc-a");
+    await tick();
+    observeTurn(client, "obs-b", "tc-b");
+    await tick();
+
+    expect(calls).toEqual(["tc-a", "tc-b"]);
+    unmount();
+  });
+
+  it("runs a call once however many times the transcript is re-sent", async () => {
+    const calls: string[] = [];
+    const { chat, client, unmount } = mountChat({
+      onToolCall: ({ toolCall }) => {
+        calls.push(toolCall.toolCallId);
+      },
+    });
+
+    observeTurn(client, "obs-1", "tc-1");
+    await tick();
+
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: chat.chat.messages });
+    await tick();
+
+    expect(calls).toEqual(["tc-1"]);
+    unmount();
+  });
+});
+
+// ── the continuation race (announced before the launch) ─────────
+
+describe("useAgentChat — a continuation the server announces early", () => {
+  const APPROVAL = "approval-1";
+
+  const awaitingApproval = (): UIMessage => ({
+    id: "a-1",
+    role: "assistant",
+    parts: [
+      {
+        type: "tool-echo",
+        toolCallId: "tc-approve",
+        state: "approval-requested",
+        input: { x: 1 },
+        approval: { id: APPROVAL },
+      },
+    ],
+  });
+
+  it("observes the server's turn instead of launching a second one for it", async () => {
+    const calls: string[] = [];
+    const { chat, client, unmount } = mountChat({
+      initialMessages: [userMessage("hi"), awaitingApproval()],
+      onToolCall: ({ toolCall }) => {
+        calls.push(toolCall.toolCallId);
+      },
+    });
+
+    await chat.addToolApprovalResponse({ id: APPROVAL, approved: true });
+
+    // The announcement beats this client's scheduled launch, which is the race itself: the
+    // continuation is armed, and nothing is awaiting a resume yet.
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "cont-1" });
+    await tick();
+
+    expect(client.sent().filter((frame) => frame.type === "cf_agent_stream_resume_request")).toHaveLength(0);
+    expect(client.lastSentOfType<{ id: string }>("cf_agent_stream_resume_ack")?.id).toBe("cont-1");
+
+    // The server then streams the continuation of the same assistant message.
+    const chunk = (body: unknown) =>
+      client.emitMessage({
+        type: "cf_agent_use_chat_response",
+        id: "cont-1",
+        body: JSON.stringify(body),
+        continuation: true,
+      });
+    chunk({ type: "start", messageId: "a-1" });
+    chunk({ type: "tool-input-available", toolCallId: "tc-after", toolName: "echo", input: {} });
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: "cont-1", body: "", done: true, continuation: true });
+    await tick();
+
+    expect(chat.chat.messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+    expect(calls).toEqual(["tc-after"]);
+    unmount();
+  });
+});
+
+// ── the two options an application wires ────────────────────────
+
+describe("useAgentChat — onFrame", () => {
+  it("sees every frame before the protocol does, and consumes the ones it claims", async () => {
+    const seen: string[] = [];
+    const { chat, client, unmount } = mountChat({
+      initialMessages: [userMessage("hi")],
+      onFrame: (frame) => {
+        const type = (frame as { type?: string }).type;
+        if (type) {
+          seen.push(type);
+        }
+        return type === "app_own_frame";
+      },
+    });
+
+    client.emitMessage({ type: "app_own_frame", payload: { anything: true } });
+    client.emitMessage({ type: "cf_agent_chat_clear" });
+    await tick();
+
+    expect(seen).toEqual(["app_own_frame", "cf_agent_chat_clear"]);
+    // The frame it did not claim still reached the protocol handling.
+    expect(chat.chat.messages).toEqual([]);
+    unmount();
+  });
+});
+
+describe("useAgentChat — mergeMessages", () => {
+  it("is asked how a reconnect's read joins what is on screen", async () => {
+    const stored = [userMessage("hi"), assistantMessage("stored answer", "a-stored")];
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(stored)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const merge = vi.fn((_onScreen: UIMessage[], read: UIMessage[]) => read);
+    const { chat, client, unmount } = mountChat({ initialMessages: [userMessage("hi")], mergeMessages: merge });
+
+    // A close followed by an open is what makes the socket a replacement, which owes the
+    // transcript a read: nothing pushes a snapshot on connect.
+    client.emit("close", new CloseEvent("close"));
+    client.emit("open", new Event("open"));
+    for (let i = 0; i < 8 && merge.mock.calls.length === 0; i++) {
+      await tick();
+    }
+
+    expect(merge).toHaveBeenCalledTimes(1);
+    expect(chat.chat.messages).toEqual(stored);
+    vi.unstubAllGlobals();
     unmount();
   });
 });

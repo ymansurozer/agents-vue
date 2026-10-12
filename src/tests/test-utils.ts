@@ -1,20 +1,21 @@
-import type { WebSocketLike } from "../web-socket-chat-transport";
-
 // Permissive listener type so MockSocket can satisfy both the transport's
-// MessageEvent-only `WebSocketLike` and the composable's open/close/error
+// MessageEvent-only `AgentConnection` and the composable's open/close/error
 // handlers without per-event-type overloads.
 type EventHandler = (event: never) => void;
 
 /**
- * In-memory WebSocket stand-in. Records outbound `send` calls and lets tests
+ * In-memory `AgentClient` stand-in. Records outbound `send` calls and lets tests
  * dispatch inbound messages by calling `emitMessage(...)` etc.
  *
- * Implements the transport's `WebSocketLike` minimum and the broader
- * `addEventListener` shape (open / close / error / message) the composable uses.
+ * This is the one boundary the suite fakes: upstream's `WebSocketChatTransport` reaches the
+ * server through `send` / `addEventListener` / `removeEventListener` and nothing else, so the
+ * real transport and the real `Chat` run in every test below.
  */
-export class MockSocket implements WebSocketLike {
+export class MockSocket {
   sentMessages: string[] = [];
   closed = false;
+  /** The HTTP twin of this URL is what the `get-messages` seed reads. */
+  url = "ws://localhost:9999/agents/test-agent/test";
 
   private readonly listeners = new Map<string, Set<EventHandler>>();
 
@@ -33,6 +34,10 @@ export class MockSocket implements WebSocketLike {
       };
       options.signal.addEventListener("abort", onAbort, { once: true });
     }
+  }
+
+  removeEventListener(type: string, listener: EventHandler): void {
+    this.listeners.get(type)?.delete(listener);
   }
 
   close(): void {
@@ -72,7 +77,9 @@ export class MockSocket implements WebSocketLike {
     for (let i = this.sentMessages.length - 1; i >= 0; i--) {
       try {
         const parsed = JSON.parse(this.sentMessages[i]!) as { type?: string };
-        if (parsed.type === type) return parsed as T;
+        if (parsed.type === type) {
+          return parsed as T;
+        }
       } catch {
         // ignore
       }
@@ -93,7 +100,9 @@ export async function drainStream<T>(stream: ReadableStream<T>): Promise<{ chunk
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        break;
+      }
       chunks.push(value);
     }
     return { chunks };
@@ -111,7 +120,9 @@ export async function readUntil<T>(stream: ReadableStream<T>, predicate: (chunks
   try {
     while (!predicate(chunks)) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        break;
+      }
       chunks.push(value);
     }
     return chunks;
