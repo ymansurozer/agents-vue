@@ -702,9 +702,18 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
           break;
         }
         // 0.23 carries the probe id, so a NONE answering an older probe cannot settle this one.
-        case "cf_agent_stream_resume_none":
-          transport.handleStreamResumeNone({ probeId: data.probeId });
+        case "cf_agent_stream_resume_none": {
+          const settled = transport.handleStreamResumeNone({ probeId: data.probeId });
+
+          // The server has no stream left, so a turn this client was observing in place of its own
+          // continuation has ended. Without this the continuation would stay armed for the life of
+          // the page whenever the frame that ends it was lost with the previous socket, and every
+          // later tool result would decline to continue.
+          if (settled && observedToolContinuationRequestId !== null) {
+            resetToolContinuation();
+          }
           break;
+        }
         // Pre-stream window (0.9.0): keep the in-flight resume probe waiting.
         case "cf_agent_stream_pending":
           transport.handleStreamPending();
@@ -784,7 +793,18 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     // Re-probe the stream on open, but never overlap resume calls (#1837): skip if a
     // resume is already in flight, a tool continuation is resuming, or the transport is
     // mid resume-handshake. The gate is cleared by the in-flight resume's own finalizer.
-    if (options.resume !== false && !resumeInFlight && !isResumingToolContinuation && !transport.isAwaitingResume()) {
+    //
+    // A continuation this client handed to the server is the exception: it is "resuming" with
+    // nothing of its own in flight, and the probe is the only thing that can find out how the
+    // observed turn ended now that the socket carrying it is gone.
+    const canReconcileObservedContinuation = observedToolContinuationRequestId !== null;
+
+    if (
+      options.resume !== false &&
+      !resumeInFlight &&
+      (!isResumingToolContinuation || canReconcileObservedContinuation) &&
+      !transport.isAwaitingResume()
+    ) {
       resumeInFlight = true;
       const myGeneration = resumeGeneration;
       void chat

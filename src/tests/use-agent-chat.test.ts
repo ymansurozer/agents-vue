@@ -1297,16 +1297,16 @@ describe("useAgentChat — dispatching client-side tool calls", () => {
 describe("useAgentChat — a continuation the server announces early", () => {
   const APPROVAL = "approval-1";
 
-  const awaitingApproval = (): UIMessage => ({
-    id: "a-1",
+  const awaitingApproval = (approvalId = APPROVAL, toolCallId = "tc-approve"): UIMessage => ({
+    id: `a-${toolCallId}`,
     role: "assistant",
     parts: [
       {
         type: "tool-echo",
-        toolCallId: "tc-approve",
+        toolCallId,
         state: "approval-requested",
         input: { x: 1 },
-        approval: { id: APPROVAL },
+        approval: { id: approvalId },
       },
     ],
   });
@@ -1338,13 +1338,89 @@ describe("useAgentChat — a continuation the server announces early", () => {
         body: JSON.stringify(body),
         continuation: true,
       });
-    chunk({ type: "start", messageId: "a-1" });
+    chunk({ type: "start", messageId: "a-tc-approve" });
     chunk({ type: "tool-input-available", toolCallId: "tc-after", toolName: "echo", input: {} });
     client.emitMessage({ type: "cf_agent_use_chat_response", id: "cont-1", body: "", done: true, continuation: true });
     await tick();
 
     expect(chat.chat.messages.filter((message) => message.role === "assistant")).toHaveLength(1);
     expect(calls).toEqual(["tc-after"]);
+    unmount();
+  });
+
+  it("finds out how the observed turn ended when the socket carrying it is replaced", async () => {
+    const { chat, client, unmount } = mountChat({ initialMessages: [userMessage("hi"), awaitingApproval()] });
+
+    await chat.addToolApprovalResponse({ id: APPROVAL, approved: true });
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "cont-1" });
+    await tick();
+
+    // The frame that would have ended the observed turn dies with the socket.
+    client.emit("close", new Event("close"));
+    client.emit("open", new Event("open"));
+    await tick();
+
+    const probe = client.lastSentOfType<{ probeId?: string }>("cf_agent_stream_resume_request");
+
+    expect(probe).toBeDefined();
+
+    client.emitMessage({ type: "cf_agent_stream_resume_none", probeId: probe?.probeId });
+    await tick();
+
+    // With the observed continuation forgotten, the next tool answer may arm one of its own; while
+    // it was stuck the page could never auto-continue again.
+    chat.chat.messages = [userMessage("hi"), awaitingApproval("approval-2", "tc-later")];
+    await chat.addToolApprovalResponse({ id: "approval-2", approved: true });
+    await tick();
+
+    expect(client.sent().filter((frame) => frame.type === "cf_agent_stream_resume_request").length).toBeGreaterThan(1);
+    unmount();
+  });
+});
+
+// ── message preservation and minted ids ─────────────────────────
+
+describe("useAgentChat — a full sync arriving mid-stream", () => {
+  it("keeps the server's transcript rather than appending an unmatchable tail", async () => {
+    const { chat, client, unmount } = mountChat();
+
+    // A turn this client only observes, rendered under an id it minted for itself.
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "obs-1" });
+    const chunk = (body: unknown) =>
+      client.emitMessage({ type: "cf_agent_use_chat_response", id: "obs-1", body: JSON.stringify(body) });
+    chunk({ type: "start" });
+    chunk({ type: "text-start", id: "t1" });
+    chunk({ type: "text-delta", id: "t1", delta: "half a" });
+    await tick();
+
+    // The server's own copy of the same turn, under the id storage knows it by: the minted tail
+    // matches nothing in it, and keeping both puts one turn on screen twice.
+    const stored: UIMessage = { id: "a-stored", role: "assistant", parts: [{ type: "text", text: "half an answer" }] };
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: [stored] });
+    await tick();
+
+    expect(chat.chat.messages).toEqual([stored]);
+    unmount();
+  });
+});
+
+describe("useAgentChat — minting a message id", () => {
+  it("falls back to random bytes rather than Math.random", async () => {
+    const realCrypto = globalThis.crypto;
+    vi.stubGlobal("crypto", { getRandomValues: (bytes: Uint8Array) => realCrypto.getRandomValues(bytes) });
+
+    const { chat, client, unmount } = mountChat();
+
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "obs-1" });
+    const chunk = (body: unknown) =>
+      client.emitMessage({ type: "cf_agent_use_chat_response", id: "obs-1", body: JSON.stringify(body) });
+    chunk({ type: "start" });
+    chunk({ type: "text-start", id: "t1" });
+    chunk({ type: "text-delta", id: "t1", delta: "hi" });
+    await tick();
+
+    expect(chat.chat.messages.at(-1)?.id).toMatch(/^[\da-f]{32}$/);
+    vi.unstubAllGlobals();
     unmount();
   });
 });

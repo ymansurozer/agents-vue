@@ -129,10 +129,27 @@ socket has already delivered the finished answer. The default merges by id with 
 winning and anything only on screen kept after it. Pass your own policy to decide differently.
 
 ```ts
+import type { UIMessage } from "ai";
+
+const textLength = (message: UIMessage) =>
+  message.parts.reduce((total, part) => total + (part.type === "text" ? part.text.length : 0), 0);
+
+/** The stored copy can be behind the stream, so the longer of the two wins. */
+const fresher = (stored: UIMessage, onScreen: UIMessage | undefined) =>
+  onScreen && textLength(onScreen) > textLength(stored) ? onScreen : stored;
+
 useAgentChat({
   client: { /* ... */ },
-  // Keep whichever copy of a message has more text: the stored one may be behind the stream.
-  mergeMessages: (onScreen, stored) => stored.map((message) => fresher(message, byId(onScreen, message.id))),
+  mergeMessages: (onScreen, stored) => {
+    const live = new Map(onScreen.map((message) => [message.id, message]));
+    const storedIds = new Set(stored.map((message) => message.id));
+
+    return [
+      ...stored.map((message) => fresher(message, live.get(message.id))),
+      // Anything only on screen — a question typed while the socket was down — is kept after.
+      ...onScreen.filter((message) => !storedIds.has(message.id)),
+    ];
+  },
 });
 ```
 

@@ -17,6 +17,7 @@ Rebased onto AI SDK v7 and `agents` 0.27, with upstream's own transport and the 
 - The continuation is armed before the `cf_agent_tool_result` / `cf_agent_tool_approval` frame is sent, so the common case does not race at all.
 - A streaming assistant tail that matches nothing in an incoming sync is dropped rather than appended, which is what put the same turn on screen twice.
 - Message ids are minted with `crypto.randomUUID` and otherwise from `crypto.getRandomValues`, never `Math.random`.
+- A continuation handed to the server is released when the socket carrying that turn is replaced: the reconnect probe runs for exactly that case, and a `cf_agent_stream_resume_none` settles the continuation it answers. Without it a dropped socket left the page unable to auto-continue after any later tool result.
 
 ### 🚀 Enhancements
 

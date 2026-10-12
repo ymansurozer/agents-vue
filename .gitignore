@@ -2,6 +2,9 @@ node_modules/
 dist/
 coverage/
 
+# `npm pack` output, which is how a consumer is given a build to try before a release
+*.tgz
+
 # Vitest browser mode failure artifacts (screenshots, attachments)
 .vitest-attachments/
 __screenshots__/
