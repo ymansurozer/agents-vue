@@ -103,6 +103,7 @@ Returns:
 | `onStateUpdate` | `(state: State, source: "server" \| "client") => void` | — | The agent's state, on connect and on every change the server broadcasts. |
 | `onFrame` | `(frame: unknown) => boolean \| void` | — | Every socket frame, parsed, **before** the chat protocol reads it. Return `true` to consume it. |
 | `mergeMessages` | `(onScreen, stored) => ChatMessage[]` | merge by id | How a reconnect's read of the stored transcript joins the one on screen. |
+| `sendOnlyNewMessages` | `boolean` | `false` | A send carries only the messages after the last one the server is known to hold, named as `afterMessageId`. The server must rebuild the rest. |
 
 ### `onFrame` — your own frames
 
@@ -151,6 +152,45 @@ useAgentChat({
     ];
   },
 });
+```
+
+### `sendOnlyNewMessages` — sending what the server does not have
+
+By default every send carries the whole transcript, so a request grows with the session. With
+`sendOnlyNewMessages: true` it carries only the messages after the last one the server is known to
+hold — usually just the new question — and names that message as `afterMessageId`, beside
+`messages` in the request body. Known to hold means seen arriving from the server: `initialMessages`,
+the `get-messages` read, a broadcast, a `cf_agent_message_updated` frame, or a stream that finished
+without an error with a part in its reply. A message only this client has never counts. A request
+that rewrites a message in place carries it too: an edited question, or the assistant message a
+bare `sendMessage()` resubmits after an approval or a tool output. A regenerate, and a send before
+the server is known to hold anything, carry the full list and no `afterMessageId`.
+
+A client tool's output is not part of any request: it reaches the server in a `cf_agent_tool_result`
+frame, with the option on or off. What changes is the next request. A question typed after a tool
+output carries only the question, where the full list re-sent the output along with everything
+else; only a request a bare `sendMessage()` makes carries the rewritten assistant message.
+
+**The server's half.** A request with `afterMessageId` holds only part of the transcript, so the
+server must rebuild the full list before it persists the request or broadcasts it — `AIChatAgent`
+broadcasts a request's list to the other clients as it arrived. When the first message sent is one
+it already stores, at index `k`, the request rewrites in place, and the full list is its stored
+messages before `k`, then the ones sent. Otherwise the messages sent are new and go after the whole
+stored transcript, less any it already stores, so a client that missed messages another client
+added does not erase them. The rebuild reads `afterMessageId` only to know the list is partial: its
+value, the last message the client saw the server hold, is a hint, and can name a reply the server
+never stored. A request without the field carries the full list, as before. `AIChatAgent` does none
+of this on its own: it takes a request's list for the whole transcript and deletes the stored
+messages missing from it, which is why the option is off by default.
+
+```ts
+function rebuild(stored: UIMessage[], sent: UIMessage[], afterMessageId?: string): UIMessage[] {
+  if (afterMessageId === undefined) return sent;
+  const rewriteAt = stored.findIndex((message) => message.id === sent[0]?.id);
+  if (rewriteAt >= 0) return [...stored.slice(0, rewriteAt), ...sent];
+  const storedIds = new Set(stored.map((message) => message.id));
+  return [...stored, ...sent.filter((message) => !storedIds.has(message.id))];
+}
 ```
 
 ### Client-side tools

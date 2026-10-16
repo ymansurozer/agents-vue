@@ -32,7 +32,15 @@ import { broadcastTransition } from "agents/chat";
 import type { BroadcastStreamState } from "agents/chat";
 import { WebSocketChatTransport } from "agents/chat/transport";
 import { AgentClient, type AgentClientOptions, type AgentConnectionError } from "agents/client";
-import { getToolName, isToolUIPart, type ChatStatus, type JSONSchema7, type Tool, type UIMessage } from "ai";
+import {
+  getToolName,
+  isToolUIPart,
+  type ChatStatus,
+  type ChatTransport,
+  type JSONSchema7,
+  type Tool,
+  type UIMessage,
+} from "ai";
 import { onScopeDispose, ref, watch } from "vue";
 
 interface AgentClientTool<Input = unknown, Output = unknown> {
@@ -116,6 +124,25 @@ export interface UseAgentChatOptions<
    * differently — which copy of a message is fresher, say.
    */
   mergeMessages?: (onScreen: ChatMessage[], stored: ChatMessage[]) => ChatMessage[];
+  /**
+   * When true, a send carries only the messages after the last one the server is known to hold, and
+   * names that message in the request body as `afterMessageId`. Known to hold means seen arriving
+   * from the server — in `initialMessages`, the `get-messages` read, a `cf_agent_chat_messages`
+   * broadcast, a `cf_agent_message_updated` frame, or a stream that finished without an error with
+   * a part in its reply — never a message only this client has.
+   *
+   * A request that rewrites a message in place carries it too: an edited question, or the assistant
+   * message a bare `sendMessage()` resubmits after an approval or a tool output. A tool output itself
+   * travels in its own frame, so a question typed after one no longer carries it. A regenerate, and a
+   * send before the server is known to hold anything, carry the full list and no `afterMessageId`.
+   *
+   * Turn it on only against a server that rebuilds the transcript before it persists or broadcasts
+   * the request: when the first message sent is one it stores, its stored messages before that one,
+   * then the ones sent; otherwise its whole stored transcript, then the sent messages it does not
+   * already store, so a client that missed another's messages does not erase them. `AIChatAgent` on
+   * its own takes a request's list for the whole transcript, and would keep only the messages sent.
+   */
+  sendOnlyNewMessages?: boolean;
   /**
    * Called with the agent's state, on connect and on every change the server broadcasts.
    *
@@ -328,6 +355,22 @@ function mergeById<ChatMessage extends UIMessage>(onScreen: ChatMessage[], store
   return [...stored, ...onScreen.filter((message) => !storedIds.has(message.id))];
 }
 
+function idsOf(messages: UIMessage[]): string[] {
+  return messages.map((message) => message.id);
+}
+
+/** The message id a stream's opening `start` chunk carries, when `body` is one. */
+function startMessageIdOf(body: string): string | null {
+  try {
+    const chunk: unknown = JSON.parse(body);
+    return isRecord(chunk) && chunk.type === "start" && typeof chunk.messageId === "string" ? chunk.messageId : null;
+  } catch {
+    return null;
+  }
+}
+
+type ChatRequest<ChatMessage extends UIMessage> = Parameters<ChatTransport<ChatMessage>["sendMessages"]>[0];
+
 function createMessageId(): string {
   if (globalThis.crypto?.randomUUID) {
     return globalThis.crypto.randomUUID();
@@ -357,6 +400,13 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   let observedToolContinuationRequestId: string | null = null;
   /** Tool calls already handed to the caller, so a re-render or a re-sync cannot run one twice. */
   const dispatchedToolCallIds = new Set<string>();
+  /**
+   * The transcript the server is known to hold, as ids in order: the history it sent, or what was
+   * on screen through the last message it was seen to hold. What `sendOnlyNewMessages` sends after.
+   */
+  let heldMessageIds = idsOf(options.initialMessages ?? []);
+  /** Each stream's own message id, from its `start` chunk, until the stream's terminal frame. */
+  const streamMessageIds = new Map<string, string | null>();
   // Serialize reconnect resume re-probes (#1837, upstream agents 0.17.2). The AI SDK's
   // Chat.makeRequest shares one mutable activeResponse with no concurrency guard, so a
   // second resumeStream() issued while the first is still in flight (reconnect storm)
@@ -434,9 +484,78 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
 
   const chat = new Chat<ChatMessage>({
     messages: options.initialMessages,
-    transport,
+    transport: options.sendOnlyNewMessages
+      ? {
+          sendMessages: (request) => transport.sendMessages(onlyNewMessages(request)),
+          reconnectToStream: (request) => transport.reconnectToStream(request),
+        }
+      : transport,
     onError: options.onError,
   });
+
+  /**
+   * The request `sendOnlyNewMessages` sends: the messages after those the server holds — from the
+   * one the request rewrites in place, when that comes earlier — with the message before them named
+   * as `afterMessageId`. A regenerate goes whole, and so does a request with nothing held ahead of
+   * what it sends or nothing new to send.
+   */
+  function onlyNewMessages(request: ChatRequest<ChatMessage>): ChatRequest<ChatMessage> {
+    if (request.trigger === "regenerate-message") {
+      return request;
+    }
+
+    const { messages } = request;
+    let held = 0;
+    while (held < messages.length && messages[held]?.id === heldMessageIds[held]) {
+      held++;
+    }
+
+    const rewrittenIndex = messages.findIndex((message) => message.id === request.messageId);
+    const start = rewrittenIndex >= 0 ? Math.min(held, rewrittenIndex) : held;
+    if (rewrittenIndex >= 0) {
+      // The stored copy of the rewritten message no longer matches the one on screen under the same
+      // id, and this request may never land. A later stream that ends cleanly holds it again.
+      heldMessageIds = heldMessageIds.slice(0, start);
+    }
+
+    const afterMessageId = messages[start - 1]?.id;
+    if (afterMessageId === undefined || start === messages.length) {
+      return request;
+    }
+
+    return { ...request, messages: messages.slice(start), body: { ...request.body, afterMessageId } };
+  }
+
+  /** The server holds everything on screen through `messageId`, if that message is on screen. */
+  function holdThrough(messageId: string) {
+    const index = chat.messages.findIndex((message) => message.id === messageId);
+    if (index >= 0) {
+      heldMessageIds = idsOf(chat.messages.slice(0, index + 1));
+    }
+  }
+
+  /**
+   * A stream's own message is held once the stream ends without an error: `AIChatAgent` holds a
+   * turn's terminal frame back until its persist step has run, and turns it into an error when
+   * persisting fails. It persists only a reply with a part, yet ends a stop straight after `start`
+   * cleanly, so an empty reply is not held. A reply a stall recovery discards still is, which the
+   * rebuild makes harmless by keying a rewrite on the first message sent, not on the anchor. A
+   * continuation's `start` carries no id, since it extends a message the server already holds.
+   */
+  function trackStreamMessage(requestId: string, frame: ProtocolMessage<ChatMessage>) {
+    if (frame.done || frame.error) {
+      // An error chunk's frame is followed by a `done` without `error`; the stream is already
+      // forgotten by then, so that `done` holds nothing.
+      const messageId = streamMessageIds.get(requestId);
+      streamMessageIds.delete(requestId);
+      const reply = chat.messages.find((message) => message.id === messageId);
+      if (reply && reply.parts.length > 0 && !frame.error) {
+        holdThrough(reply.id);
+      }
+    } else if (!streamMessageIds.has(requestId) && frame.body?.trim()) {
+      streamMessageIds.set(requestId, startMessageIdOf(frame.body));
+    }
+  }
 
   /**
    * Hands the caller every tool call the transcript is waiting on, whatever painted it.
@@ -547,6 +666,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     isServerStreaming.value = false;
     streamState = broadcastTransition(streamState, { type: "clear" }).state;
     chat.messages = [];
+    heldMessageIds = [];
     socket.send(JSON.stringify({ type: "cf_agent_chat_clear" }));
   }
 
@@ -644,12 +764,14 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
             chat.status === "streaming" || chat.status === "submitted" || streamState.status !== "idle"
               ? preserveActiveStreamMessages(chat.messages, data.messages ?? [])
               : (data.messages ?? []);
+          heldMessageIds = idsOf(data.messages ?? []);
           break;
 
         // Single message update (e.g. tool result applied)
         case "cf_agent_message_updated":
           if (data.message) {
             chat.messages = replaceUpdatedMessage(chat.messages, data.message);
+            holdThrough(data.message.id);
           }
           break;
 
@@ -657,6 +779,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
         case "cf_agent_chat_clear":
           streamState = broadcastTransition(streamState, { type: "clear" }).state;
           chat.messages = [];
+          heldMessageIds = [];
           isRecovering.value = false;
           isServerStreaming.value = false;
           break;
@@ -723,6 +846,10 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
           isRecovering.value = Boolean(data.recovering);
           break;
         case "cf_agent_use_chat_response":
+          if (data.id) {
+            trackStreamMessage(data.id, data);
+          }
+
           if (!data.id || activeRequestIds.has(data.id)) {
             return;
           }
@@ -831,6 +958,8 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     // A new connection legitimately needs a fresh ACK + replay, and any in-progress
     // recovery hint is stale once the socket drops.
     fallbackAckedResumeRequestIds.clear();
+    // A stream the socket was carrying is replayed from its `start` on the replacement, or never ends.
+    streamMessageIds.clear();
     isRecovering.value = false;
     connectionState.value = "reconnecting";
     resyncPending = true;
@@ -903,6 +1032,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
       const stored = await fetchStoredMessages();
       if (stored && chat.messages.length === 0) {
         chat.messages = stored;
+        heldMessageIds = idsOf(stored);
       }
     } finally {
       initialMessagesLoaded.value = true;
@@ -915,6 +1045,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
 
     if (stored) {
       chat.messages = (options.mergeMessages ?? mergeById)(chat.messages, stored);
+      heldMessageIds = idsOf(stored);
     }
   }
   return {
