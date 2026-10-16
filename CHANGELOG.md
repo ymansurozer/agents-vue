@@ -5,7 +5,7 @@
 
 ### 🚀 Enhancements
 
-- `sendOnlyNewMessages` option: a send carries only the messages after the last one the server is known to hold, naming it as `afterMessageId` in the request body, rather than the whole transcript. A tool result or an edit carries the message it rewrote; a regenerate carries the full list. The server must rebuild the full list from its stored copy: from `afterMessageId` when the first message sent is one it stores, and after the whole stored transcript otherwise, so a client that missed another's messages does not erase them. The option is off by default, and with it off a request body is unchanged.
+- `sendOnlyNewMessages` option: a send carries only the messages after the last one the server is known to hold, naming it as `afterMessageId` in the request body, rather than the whole transcript. An edit, or a bare `sendMessage()` resubmitting after an approval or a tool output, carries the message it rewrote; a regenerate carries the full list. The server must rebuild the full list before it persists or broadcasts the request: when the first message sent is one it stores, its stored messages before that one, then the ones sent; otherwise its whole stored transcript, then the sent messages it does not already store, so a client that missed another's messages does not erase them. The option is off by default, and with it off a request body is unchanged.
 
 ## v0.3.0
 

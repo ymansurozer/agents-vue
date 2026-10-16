@@ -128,18 +128,19 @@ export interface UseAgentChatOptions<
    * When true, a send carries only the messages after the last one the server is known to hold, and
    * names that message in the request body as `afterMessageId`. Known to hold means seen arriving
    * from the server — in `initialMessages`, the `get-messages` read, a `cf_agent_chat_messages`
-   * broadcast, a `cf_agent_message_updated` frame, or a stream that finished — never a message only
-   * this client has.
+   * broadcast, a `cf_agent_message_updated` frame, or a stream that finished without an error with
+   * a part in its reply — never a message only this client has.
    *
-   * A request that rewrites a message in place carries it too: the assistant message a tool result
-   * or an approval updated, or an edited question. A regenerate, and a send before the server is
-   * known to hold anything, carry the full list and no `afterMessageId`.
+   * A request that rewrites a message in place carries it too: an edited question, or the assistant
+   * message a bare `sendMessage()` resubmits after an approval or a tool output. A tool output itself
+   * travels in its own frame, so a question typed after one no longer carries it. A regenerate, and a
+   * send before the server is known to hold anything, carry the full list and no `afterMessageId`.
    *
-   * Turn it on only against a server that rebuilds the transcript: when the first message sent is
-   * one it stores, the stored messages up to and including `afterMessageId`, then the ones sent;
-   * otherwise the whole stored transcript, then the ones sent, so a client that missed another's
-   * messages does not erase them. `AIChatAgent` on its own takes a request's list for the whole
-   * transcript, and would keep only the messages sent.
+   * Turn it on only against a server that rebuilds the transcript before it persists or broadcasts
+   * the request: when the first message sent is one it stores, its stored messages before that one,
+   * then the ones sent; otherwise its whole stored transcript, then the sent messages it does not
+   * already store, so a client that missed another's messages does not erase them. `AIChatAgent` on
+   * its own takes a request's list for the whole transcript, and would keep only the messages sent.
    */
   sendOnlyNewMessages?: boolean;
   /**
@@ -536,17 +537,20 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   /**
    * A stream's own message is held once the stream ends without an error: `AIChatAgent` holds a
    * turn's terminal frame back until its persist step has run, and turns it into an error when
-   * persisting fails. A reply with no parts (a stop straight after `start`) or one a stall recovery
-   * discards ends cleanly without being stored, but a server answers an anchor it does not hold by
-   * appending, so the next send still lands. A continuation's `start` carries no id, since it
-   * extends a message the server already holds.
+   * persisting fails. It persists only a reply with a part, yet ends a stop straight after `start`
+   * cleanly, so an empty reply is not held. A reply a stall recovery discards still is, which the
+   * rebuild makes harmless by keying a rewrite on the first message sent, not on the anchor. A
+   * continuation's `start` carries no id, since it extends a message the server already holds.
    */
   function trackStreamMessage(requestId: string, frame: ProtocolMessage<ChatMessage>) {
     if (frame.done || frame.error) {
+      // An error chunk's frame is followed by a `done` without `error`; the stream is already
+      // forgotten by then, so that `done` holds nothing.
       const messageId = streamMessageIds.get(requestId);
       streamMessageIds.delete(requestId);
-      if (messageId && !frame.error) {
-        holdThrough(messageId);
+      const reply = chat.messages.find((message) => message.id === messageId);
+      if (reply && reply.parts.length > 0 && !frame.error) {
+        holdThrough(reply.id);
       }
     } else if (!streamMessageIds.has(requestId) && frame.body?.trim()) {
       streamMessageIds.set(requestId, startMessageIdOf(frame.body));

@@ -1688,6 +1688,80 @@ describe("useAgentChat — sendOnlyNewMessages", () => {
     unmount();
   });
 
+  it("never anchors on a reply stopped before its first part, so a later edit is carried", async () => {
+    const { chat, client, unmount } = mountChat({
+      sendOnlyNewMessages: true,
+      initialMessages: [userMessage("hi"), assistantMessage("hello")],
+      onError: () => {},
+    });
+
+    void chat.chat.sendMessage({ id: "u2", role: "user", parts: [{ type: "text", text: "second" }] });
+    const stopped = await nthRequest(client, 1);
+    client.emitMessage({
+      type: "cf_agent_use_chat_response",
+      id: stopped.id,
+      body: JSON.stringify({ type: "start", messageId: "a2" }),
+    });
+    await tick();
+    await chat.stop();
+    expect(chat.chat.messages.at(-1)).toMatchObject({ id: "a2", parts: [] });
+    // `AIChatAgent` stores no reply without a part, and still ends the stopped turn with a clean `done`.
+    client.emitMessage({
+      type: "cf_agent_use_chat_response",
+      id: stopped.id,
+      body: "",
+      done: true,
+      outcome: "aborted",
+    });
+    await tick();
+
+    void chat.chat.sendMessage({ id: "u3", role: "user", parts: [{ type: "text", text: "third" }] });
+    const send = await nthRequest(client, 2);
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: send.id, body: "boom", done: true, error: true });
+    await tick();
+
+    void chat.chat.sendMessage({ text: "third, edited", messageId: "u3" });
+    const edit = await nthRequest(client, 3);
+
+    expect(send.body.afterMessageId).toBe("a1");
+    expect(send.body.messages[0]?.id).toBe("u2");
+    expect(edit.body.afterMessageId).toBe("a1");
+    expect(edit.body.messages.at(-1)).toMatchObject({ id: "u3", parts: [{ type: "text", text: "third, edited" }] });
+    unmount();
+  });
+
+  it("holds nothing for a reply whose error frame comes before the turn's `done`", async () => {
+    const { chat, client, unmount } = mountChat({
+      sendOnlyNewMessages: true,
+      initialMessages: [userMessage("hi"), assistantMessage("hello")],
+      onError: () => {},
+    });
+
+    void chat.chat.sendMessage({ id: "u2", role: "user", parts: [{ type: "text", text: "second" }] });
+    const failed = await nthRequest(client, 1);
+    for (const chunk of [
+      { type: "start", messageId: "a2" },
+      { type: "text-start", id: "t" },
+      { type: "text-delta", id: "t", delta: "partial" },
+    ]) {
+      client.emitMessage({ type: "cf_agent_use_chat_response", id: failed.id, body: JSON.stringify(chunk) });
+      await tick();
+    }
+    expect(chat.chat.messages.at(-1)?.id).toBe("a2");
+    // The order `AIChatAgent` sends an error chunk in: an error frame, then a `done` without `error`.
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: failed.id, body: "boom", error: true });
+    await tick();
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: failed.id, body: "", done: true, outcome: "error" });
+    await tick();
+
+    void chat.chat.sendMessage({ id: "u3", role: "user", parts: [{ type: "text", text: "third" }] });
+    const { body } = await nthRequest(client, 2);
+
+    expect(body.afterMessageId).toBe("a1");
+    expect(body.messages[0]?.id).toBe("u2");
+    unmount();
+  });
+
   it("sends the full list for a regenerate", async () => {
     const { chat, client, unmount } = mountChat({
       sendOnlyNewMessages: true,
