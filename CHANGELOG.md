@@ -1,7 +1,9 @@
 # Changelog
 
 
-## Unreleased
+## v0.4.0
+
+[compare changes](https://github.com/ymansurozer/agents-vue/compare/v0.3.0...v0.4.0)
 
 ### 🚀 Enhancements
 
