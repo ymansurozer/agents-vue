@@ -135,9 +135,11 @@ export interface UseAgentChatOptions<
    * or an approval updated, or an edited question. A regenerate, and a send before the server is
    * known to hold anything, carry the full list and no `afterMessageId`.
    *
-   * Turn it on only against a server that rebuilds the transcript as the stored messages up to and
-   * including `afterMessageId`, then the ones sent. `AIChatAgent` on its own takes a request's list
-   * for the whole transcript, and would keep only the messages sent.
+   * Turn it on only against a server that rebuilds the transcript: when the first message sent is
+   * one it stores, the stored messages up to and including `afterMessageId`, then the ones sent;
+   * otherwise the whole stored transcript, then the ones sent, so a client that missed another's
+   * messages does not erase them. `AIChatAgent` on its own takes a request's list for the whole
+   * transcript, and would keep only the messages sent.
    */
   sendOnlyNewMessages?: boolean;
   /**

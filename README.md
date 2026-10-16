@@ -167,18 +167,24 @@ regenerate, and a send before the server is known to hold anything, carry the fu
 `afterMessageId`.
 
 **The server's half.** A request with `afterMessageId` holds only part of the transcript, so the
-server must rebuild the full list before anything reads it: its stored messages up to and including
-`afterMessageId`, then the ones sent. When it does not hold `afterMessageId` — the message was
-deleted, or the client's copy is out of date — it appends the sent messages to its stored
-transcript. A request without the field carries the full list, as before. `AIChatAgent` does none
-of this on its own: it takes a request's list for the whole transcript and deletes the stored
-messages missing from it, which is why the option is off by default.
+server must rebuild the full list before anything reads it. When the first message sent is one it
+already stores, the request rewrites in place — a tool result, an approval, an edit — and the full
+list is its stored messages up to and including `afterMessageId`, then the ones sent. Otherwise
+every message sent is new, and goes after the whole stored transcript, so a client that missed
+messages another client added does not erase them. The same goes when the server does not hold
+`afterMessageId` at all. A request without the field carries the full list, as before.
+`AIChatAgent` does none of this on its own: it takes a request's list for the whole transcript and
+deletes the stored messages missing from it, which is why the option is off by default.
 
 ```ts
 function rebuild(stored: UIMessage[], sent: UIMessage[], afterMessageId?: string): UIMessage[] {
   if (afterMessageId === undefined) return sent;
+  const storedIds = new Set(stored.map((message) => message.id));
   const anchor = stored.findIndex((message) => message.id === afterMessageId);
-  return anchor < 0 ? [...stored, ...sent] : [...stored.slice(0, anchor + 1), ...sent];
+  const rewritesInPlace = anchor >= 0 && sent[0] !== undefined && storedIds.has(sent[0].id);
+  return rewritesInPlace
+    ? [...stored.slice(0, anchor + 1), ...sent]
+    : [...stored, ...sent.filter((message) => !storedIds.has(message.id))];
 }
 ```
 
