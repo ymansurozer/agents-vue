@@ -103,6 +103,7 @@ Returns:
 | `onStateUpdate` | `(state: State, source: "server" \| "client") => void` | — | The agent's state, on connect and on every change the server broadcasts. |
 | `onFrame` | `(frame: unknown) => boolean \| void` | — | Every socket frame, parsed, **before** the chat protocol reads it. Return `true` to consume it. |
 | `mergeMessages` | `(onScreen, stored) => ChatMessage[]` | merge by id | How a reconnect's read of the stored transcript joins the one on screen. |
+| `sendOnlyNewMessages` | `boolean` | `false` | A send carries only the messages after the last one the server is known to hold, named as `afterMessageId`. The server must rebuild the rest. |
 
 ### `onFrame` — your own frames
 
@@ -151,6 +152,34 @@ useAgentChat({
     ];
   },
 });
+```
+
+### `sendOnlyNewMessages` — sending what the server does not have
+
+By default every send carries the whole transcript, so a request grows with the session. With
+`sendOnlyNewMessages: true` it carries only the messages after the last one the server is known to
+hold — usually just the new question — and names that message as `afterMessageId`, beside
+`messages` in the request body. Known to hold means seen arriving from the server: `initialMessages`,
+the `get-messages` read, a broadcast, a `cf_agent_message_updated` frame, or a stream that finished.
+A message only this client has never counts. A request that rewrites a message in place carries it
+too — the assistant message a tool result or an approval updated, or an edited question. A
+regenerate, and a send before the server is known to hold anything, carry the full list and no
+`afterMessageId`.
+
+**The server's half.** A request with `afterMessageId` holds only part of the transcript, so the
+server must rebuild the full list before anything reads it: its stored messages up to and including
+`afterMessageId`, then the ones sent. When it does not hold `afterMessageId` — the message was
+deleted, or the client's copy is out of date — it appends the sent messages to its stored
+transcript. A request without the field carries the full list, as before. `AIChatAgent` does none
+of this on its own: it takes a request's list for the whole transcript and deletes the stored
+messages missing from it, which is why the option is off by default.
+
+```ts
+function rebuild(stored: UIMessage[], sent: UIMessage[], afterMessageId?: string): UIMessage[] {
+  if (afterMessageId === undefined) return sent;
+  const anchor = stored.findIndex((message) => message.id === afterMessageId);
+  return anchor < 0 ? [...stored, ...sent] : [...stored.slice(0, anchor + 1), ...sent];
+}
 ```
 
 ### Client-side tools

@@ -1443,7 +1443,7 @@ describe("useAgentChat — minting a message id", () => {
   });
 });
 
-// ── the two options an application wires ────────────────────────
+// ── the three options an application wires ──────────────────────
 
 describe("useAgentChat — onFrame", () => {
   it("sees every frame before the protocol does, and consumes the ones it claims", async () => {
@@ -1490,6 +1490,222 @@ describe("useAgentChat — mergeMessages", () => {
     expect(merge).toHaveBeenCalledTimes(1);
     expect(chat.chat.messages).toEqual(stored);
     vi.unstubAllGlobals();
+    unmount();
+  });
+});
+
+describe("useAgentChat — sendOnlyNewMessages", () => {
+  interface SentRequest {
+    id: string;
+    raw: string;
+    body: { messages: UIMessage[]; trigger: string; afterMessageId?: string };
+  }
+
+  /** The `count`-th chat request this client sent, once the transport has flushed it. */
+  async function nthRequest(client: MockClientLike, count: number): Promise<SentRequest> {
+    for (let i = 0; i < 10; i++) {
+      const request = client
+        .sent<{ type: string; id: string; init: { body: string } }>()
+        .filter((frame) => frame.type === "cf_agent_use_chat_request")[count - 1];
+      if (request) {
+        return { id: request.id, raw: request.init.body, body: JSON.parse(request.init.body) as SentRequest["body"] };
+      }
+      await tick();
+    }
+    throw new Error(`chat request ${count} was not sent within 10 ticks`);
+  }
+
+  const ids = (messages: UIMessage[]) => messages.map((message) => message.id);
+
+  it("sends exactly 0.3.0's body when off", async () => {
+    const { chat, client, unmount } = mountChat({
+      initialMessages: [userMessage("hi"), assistantMessage("hello")],
+      body: { tenant: "acme" },
+      onError: () => {},
+    });
+
+    void chat.chat.sendMessage({ id: "u2", role: "user", parts: [{ type: "text", text: "next" }] });
+    const request = await nthRequest(client, 1);
+
+    expect(request.raw).toBe(
+      '{"messages":[' +
+        '{"id":"u1","role":"user","parts":[{"type":"text","text":"hi"}]},' +
+        '{"id":"a1","role":"assistant","parts":[{"type":"text","text":"hello"}]},' +
+        '{"id":"u2","role":"user","parts":[{"type":"text","text":"next"}]}' +
+        '],"trigger":"submit-message","tenant":"acme"}',
+    );
+    unmount();
+  });
+
+  /** A reply the server streams and persists, one frame per task as a socket delivers them. */
+  async function streamReply(client: MockClientLike, requestId: string, messageId: string) {
+    const chunks = [
+      { type: "start", messageId },
+      { type: "text-start", id: "t" },
+      { type: "text-delta", id: "t", delta: "answer" },
+      { type: "text-end", id: "t" },
+    ];
+    for (const chunk of chunks) {
+      client.emitMessage({ type: "cf_agent_use_chat_response", id: requestId, body: JSON.stringify(chunk) });
+      await tick();
+    }
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: requestId, body: "", done: true });
+    await tick();
+  }
+
+  it("sends only the new message after the history read, anchored on its last message", async () => {
+    const stored = [userMessage("hi"), assistantMessage("hello")];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(stored))));
+    const { chat, client, unmount } = mountChat({ sendOnlyNewMessages: true, resume: false, onError: () => {} });
+
+    client.emit("open", new Event("open"));
+    for (let i = 0; i < 8 && !chat.initialMessagesLoaded.value; i++) {
+      await tick();
+    }
+
+    void chat.chat.sendMessage({ id: "u2", role: "user", parts: [{ type: "text", text: "next" }] });
+    const { body } = await nthRequest(client, 1);
+
+    expect(ids(body.messages)).toEqual(["u2"]);
+    expect(body.afterMessageId).toBe("a1");
+    vi.unstubAllGlobals();
+    unmount();
+  });
+
+  it("anchors on a broadcast's last message", async () => {
+    const { chat, client, unmount } = mountChat({
+      sendOnlyNewMessages: true,
+      initialMessages: [userMessage("hi"), assistantMessage("hello")],
+      onError: () => {},
+    });
+
+    client.emitMessage({
+      type: "cf_agent_chat_messages",
+      messages: [
+        userMessage("hi"),
+        assistantMessage("hello"),
+        userMessage("from another tab", "u2"),
+        assistantMessage("its answer", "a2"),
+      ],
+    });
+    void chat.chat.sendMessage({ id: "u3", role: "user", parts: [{ type: "text", text: "next" }] });
+    const { body } = await nthRequest(client, 1);
+
+    expect(ids(body.messages)).toEqual(["u3"]);
+    expect(body.afterMessageId).toBe("a2");
+    unmount();
+  });
+
+  it("anchors on the reply its own send streamed, and so never resends the question behind it", async () => {
+    const { chat, client, unmount } = mountChat({
+      sendOnlyNewMessages: true,
+      initialMessages: [userMessage("hi"), assistantMessage("hello")],
+      onError: () => {},
+    });
+
+    void chat.chat.sendMessage({ id: "u2", role: "user", parts: [{ type: "text", text: "second" }] });
+    const first = await nthRequest(client, 1);
+    await streamReply(client, first.id, "a2");
+
+    void chat.chat.sendMessage({ id: "u3", role: "user", parts: [{ type: "text", text: "third" }] });
+    const { body } = await nthRequest(client, 2);
+
+    expect(ids(first.body.messages)).toEqual(["u2"]);
+    expect(ids(body.messages)).toEqual(["u3"]);
+    expect(body.afterMessageId).toBe("a2");
+    unmount();
+  });
+
+  it("carries the assistant message a tool result updated, anchored on the message before it", async () => {
+    const { chat, client, unmount } = mountChat({
+      sendOnlyNewMessages: true,
+      autoContinueAfterToolResult: false,
+      initialMessages: [
+        userMessage("hi"),
+        {
+          id: "a1",
+          role: "assistant",
+          parts: [{ type: "tool-echo", toolCallId: "tc1", state: "input-available", input: { x: 1 } }],
+        },
+      ],
+      onError: () => {},
+    });
+
+    await chat.addToolOutput({ tool: "echo", toolCallId: "tc1", output: { echoed: 1 } });
+    void chat.chat.sendMessage();
+    const { body } = await nthRequest(client, 1);
+
+    expect(ids(body.messages)).toEqual(["a1"]);
+    expect(body.messages[0]?.parts[0]).toMatchObject({ state: "output-available", output: { echoed: 1 } });
+    expect(body.afterMessageId).toBe("u1");
+    unmount();
+  });
+
+  it("carries an edited question and everything after it, anchored on the message before it", async () => {
+    const { chat, client, unmount } = mountChat({
+      sendOnlyNewMessages: true,
+      initialMessages: [
+        userMessage("hi"),
+        assistantMessage("hello"),
+        userMessage("second", "u2"),
+        assistantMessage("its answer", "a2"),
+      ],
+      onError: () => {},
+    });
+
+    void chat.chat.sendMessage({ text: "second, edited", messageId: "u2" });
+    const { body } = await nthRequest(client, 1);
+
+    expect(ids(body.messages)).toEqual(["u2"]);
+    expect(body.messages[0]?.parts).toEqual([{ type: "text", text: "second, edited" }]);
+    expect(body.afterMessageId).toBe("a1");
+    unmount();
+  });
+
+  it("sends the full list for a regenerate", async () => {
+    const { chat, client, unmount } = mountChat({
+      sendOnlyNewMessages: true,
+      initialMessages: [
+        userMessage("hi"),
+        assistantMessage("hello"),
+        userMessage("second", "u2"),
+        assistantMessage("its answer", "a2"),
+      ],
+      onError: () => {},
+    });
+
+    void chat.chat.regenerate();
+    const { body } = await nthRequest(client, 1);
+
+    expect(body.trigger).toBe("regenerate-message");
+    expect(ids(body.messages)).toEqual(["u1", "a1", "u2"]);
+    expect(body).not.toHaveProperty("afterMessageId");
+    unmount();
+  });
+
+  it("sends the full list until the server is known to hold a message", async () => {
+    const { chat, client, unmount } = mountChat({ sendOnlyNewMessages: true, onError: () => {} });
+
+    void chat.chat.sendMessage({ id: "u1", role: "user", parts: [{ type: "text", text: "first" }] });
+    const first = await nthRequest(client, 1);
+    // The reply opens and then fails, so the server is not known to hold it.
+    client.emitMessage({
+      type: "cf_agent_use_chat_response",
+      id: first.id,
+      body: JSON.stringify({ type: "start", messageId: "a1" }),
+    });
+    await tick();
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: first.id, body: "boom", done: true, error: true });
+    await tick();
+
+    void chat.chat.sendMessage({ id: "u2", role: "user", parts: [{ type: "text", text: "again" }] });
+    const second = await nthRequest(client, 2);
+
+    expect(ids(first.body.messages)).toEqual(["u1"]);
+    expect(first.body).not.toHaveProperty("afterMessageId");
+    expect(second.body.messages[0]?.id).toBe("u1");
+    expect(second.body.messages.at(-1)?.id).toBe("u2");
+    expect(second.body).not.toHaveProperty("afterMessageId");
     unmount();
   });
 });

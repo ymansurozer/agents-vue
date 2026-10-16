@@ -1,6 +1,12 @@
 # Changelog
 
 
+## Unreleased
+
+### 🚀 Enhancements
+
+- `sendOnlyNewMessages` option: a send carries only the messages after the last one the server is known to hold, naming it as `afterMessageId` in the request body, rather than the whole transcript. A tool result or an edit carries the message it rewrote; a regenerate carries the full list. The server must rebuild the full list from its stored copy, so the option is off by default, and with it off a request body is unchanged.
+
 ## v0.3.0
 
 Rebased onto AI SDK v7 and `agents` 0.27, with upstream's own transport and the four client-side bugs the Vue port carried fixed against the React client.
