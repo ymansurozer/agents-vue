@@ -370,36 +370,6 @@ function startMessageIdOf(body: string): string | null {
 
 type ChatRequest<ChatMessage extends UIMessage> = Parameters<ChatTransport<ChatMessage>["sendMessages"]>[0];
 
-/**
- * The request {@link UseAgentChatOptions.sendOnlyNewMessages} sends: the messages after those the
- * server holds — from the one the request rewrites in place, when that comes earlier — with the
- * message before them named as `afterMessageId`. A regenerate goes whole, and so does a request
- * with nothing held ahead of what it sends.
- */
-function onlyNewMessages<ChatMessage extends UIMessage>(
-  request: ChatRequest<ChatMessage>,
-  heldMessageIds: string[],
-): ChatRequest<ChatMessage> {
-  if (request.trigger === "regenerate-message") {
-    return request;
-  }
-
-  const { messages } = request;
-  let held = 0;
-  while (held < messages.length && messages[held]?.id === heldMessageIds[held]) {
-    held++;
-  }
-
-  const rewrittenIndex = messages.findIndex((message) => message.id === request.messageId);
-  const start = rewrittenIndex >= 0 ? Math.min(held, rewrittenIndex) : held;
-  const afterMessageId = messages[start - 1]?.id;
-  if (afterMessageId === undefined) {
-    return request;
-  }
-
-  return { ...request, messages: messages.slice(start), body: { ...request.body, afterMessageId } };
-}
-
 function createMessageId(): string {
   if (globalThis.crypto?.randomUUID) {
     return globalThis.crypto.randomUUID();
@@ -515,12 +485,45 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     messages: options.initialMessages,
     transport: options.sendOnlyNewMessages
       ? {
-          sendMessages: (request) => transport.sendMessages(onlyNewMessages(request, heldMessageIds)),
+          sendMessages: (request) => transport.sendMessages(onlyNewMessages(request)),
           reconnectToStream: (request) => transport.reconnectToStream(request),
         }
       : transport,
     onError: options.onError,
   });
+
+  /**
+   * The request `sendOnlyNewMessages` sends: the messages after those the server holds — from the
+   * one the request rewrites in place, when that comes earlier — with the message before them named
+   * as `afterMessageId`. A regenerate goes whole, and so does a request with nothing held ahead of
+   * what it sends or nothing new to send.
+   */
+  function onlyNewMessages(request: ChatRequest<ChatMessage>): ChatRequest<ChatMessage> {
+    if (request.trigger === "regenerate-message") {
+      return request;
+    }
+
+    const { messages } = request;
+    let held = 0;
+    while (held < messages.length && messages[held]?.id === heldMessageIds[held]) {
+      held++;
+    }
+
+    const rewrittenIndex = messages.findIndex((message) => message.id === request.messageId);
+    const start = rewrittenIndex >= 0 ? Math.min(held, rewrittenIndex) : held;
+    if (rewrittenIndex >= 0) {
+      // The stored copy of the rewritten message no longer matches the one on screen under the same
+      // id, and this request may never land. A later stream that ends cleanly holds it again.
+      heldMessageIds = heldMessageIds.slice(0, start);
+    }
+
+    const afterMessageId = messages[start - 1]?.id;
+    if (afterMessageId === undefined || start === messages.length) {
+      return request;
+    }
+
+    return { ...request, messages: messages.slice(start), body: { ...request.body, afterMessageId } };
+  }
 
   /** The server holds everything on screen through `messageId`, if that message is on screen. */
   function holdThrough(messageId: string) {
@@ -531,9 +534,12 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   }
 
   /**
-   * A stream's own message is held once the stream ends without an error: `AIChatAgent` sends a
-   * turn's terminal frame only after its reply is persisted. A continuation's `start` carries no id,
-   * since it extends a message the server already holds.
+   * A stream's own message is held once the stream ends without an error: `AIChatAgent` holds a
+   * turn's terminal frame back until its persist step has run, and turns it into an error when
+   * persisting fails. A reply with no parts (a stop straight after `start`) or one a stall recovery
+   * discards ends cleanly without being stored, but a server answers an anchor it does not hold by
+   * appending, so the next send still lands. A continuation's `start` carries no id, since it
+   * extends a message the server already holds.
    */
   function trackStreamMessage(requestId: string, frame: ProtocolMessage<ChatMessage>) {
     if (frame.done || frame.error) {

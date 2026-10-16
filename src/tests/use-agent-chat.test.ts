@@ -1662,6 +1662,32 @@ describe("useAgentChat — sendOnlyNewMessages", () => {
     unmount();
   });
 
+  it("carries an edit the server never stored on the next send, still as a rewrite", async () => {
+    const { chat, client, unmount } = mountChat({
+      sendOnlyNewMessages: true,
+      initialMessages: [
+        userMessage("hi"),
+        assistantMessage("hello"),
+        userMessage("second", "u2"),
+        assistantMessage("its answer", "a2"),
+      ],
+      onError: () => {},
+    });
+
+    void chat.chat.sendMessage({ text: "second, edited", messageId: "u2" });
+    const edit = await nthRequest(client, 1);
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: edit.id, body: "boom", done: true, error: true });
+    await tick();
+
+    void chat.chat.sendMessage({ id: "u3", role: "user", parts: [{ type: "text", text: "third" }] });
+    const { body } = await nthRequest(client, 2);
+
+    expect(ids(body.messages)).toEqual(["u2", "u3"]);
+    expect(body.messages[0]?.parts).toEqual([{ type: "text", text: "second, edited" }]);
+    expect(body.afterMessageId).toBe("a1");
+    unmount();
+  });
+
   it("sends the full list for a regenerate", async () => {
     const { chat, client, unmount } = mountChat({
       sendOnlyNewMessages: true,
