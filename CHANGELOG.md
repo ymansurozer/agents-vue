@@ -1,6 +1,12 @@
 # Changelog
 
 
+## Unreleased
+
+### 🚀 Enhancements
+
+- `resyncOnReconnect` option: with it `false`, a replacement socket no longer re-reads `get-messages`, for a server that sends each connection its stored transcript as it opens. That `cf_agent_chat_messages` frame replaces the transcript as any broadcast does, so `mergeMessages` is not called. Only a reconnect is affected: the first open's seed still runs unless `initialMessages` is passed. The option is on by default, and with it on a reconnect reads as before.
+
 ## v0.4.0
 
 [compare changes](https://github.com/ymansurozer/agents-vue/compare/v0.3.0...v0.4.0)

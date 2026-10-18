@@ -16,8 +16,9 @@
  * - the initial `get-messages` fetch (React does this through `use()`; here it is an async seed)
  * - `connectionState` and `connectionError`, from the socket's own open/close and its terminal
  *   failures (PartySocket does the backing off; these only observe)
- * - a replacement socket re-reads `get-messages` and merges it, because nothing pushes a snapshot
- *   on connect and a turn that finished while this client was away is otherwise never seen
+ * - a replacement socket re-reads `get-messages` and merges it, because `AIChatAgent` pushes no
+ *   snapshot on connect and a turn that finished while this client was away is otherwise never
+ *   seen — unless `resyncOnReconnect` is false, for a server that pushes one itself
  * - `onStateUpdate` forwarded to the `AgentClient`, which is where React's `useAgent` takes it
  * - the four client-side bugs the Vue port carried, fixed against the React client: client-side
  *   tool calls dispatched off the rendered transcript rather than off the SDK's own callback; the
@@ -124,6 +125,20 @@ export interface UseAgentChatOptions<
    * differently — which copy of a message is fresher, say.
    */
   mergeMessages?: (onScreen: ChatMessage[], stored: ChatMessage[]) => ChatMessage[];
+  /**
+   * When true (default), a replacement socket re-reads `get-messages` and merges what it reads into
+   * the transcript on screen through `mergeMessages`, because `AIChatAgent` sends a connecting
+   * client no snapshot, and a turn that finished while this client was away is otherwise never seen.
+   *
+   * Set it to false against a server that sends its stored transcript to every connection as it
+   * opens, as a `cf_agent_chat_messages` frame, where the read would fetch the same transcript a
+   * second time. The frame is applied as any broadcast is, as a replace, so `mergeMessages` is never
+   * called; a merge of your own belongs in `onFrame`.
+   *
+   * Only a reconnect is affected. The first open's `get-messages` seed runs unless `initialMessages`
+   * is passed, with this option on or off.
+   */
+  resyncOnReconnect?: boolean;
   /**
    * When true, a send carries only the messages after the last one the server is known to hold, and
    * names that message in the request body as `afterMessageId`. Known to hold means seen arriving
@@ -424,7 +439,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
    * it is set from the socket's open and close events and drives nothing.
    */
   const connectionState = ref<"connected" | "reconnecting">("connected");
-  /** Whether this socket is a replacement, and so owes the transcript a read from storage. */
+  /** Whether this socket is a replacement that owes the transcript a read from storage. */
   let resyncPending = false;
   /** Whether a turn this client is only watching is streaming. Gates the dispatch below. */
   const isServerStreaming = ref(false);
@@ -962,7 +977,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     streamMessageIds.clear();
     isRecovering.value = false;
     connectionState.value = "reconnecting";
-    resyncPending = true;
+    resyncPending = options.resyncOnReconnect !== false;
     // PartySocket dispatches CloseEvent here; widen narrowly for the callback.
     if (options.onClose && event instanceof CloseEvent) {
       options.onClose(event);

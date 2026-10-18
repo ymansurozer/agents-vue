@@ -103,6 +103,7 @@ Returns:
 | `onStateUpdate` | `(state: State, source: "server" \| "client") => void` | — | The agent's state, on connect and on every change the server broadcasts. |
 | `onFrame` | `(frame: unknown) => boolean \| void` | — | Every socket frame, parsed, **before** the chat protocol reads it. Return `true` to consume it. |
 | `mergeMessages` | `(onScreen, stored) => ChatMessage[]` | merge by id | How a reconnect's read of the stored transcript joins the one on screen. |
+| `resyncOnReconnect` | `boolean` | `true` | A replacement socket re-reads `get-messages` and merges it. Turn it off for a server that pushes its stored transcript to each connection as it opens. |
 | `sendOnlyNewMessages` | `boolean` | `false` | A send carries only the messages after the last one the server is known to hold, named as `afterMessageId`. The server must rebuild the rest. |
 
 ### `onFrame` — your own frames
@@ -124,10 +125,11 @@ useAgentChat({
 
 ### `mergeMessages` — what a reconnect does to the transcript
 
-Nothing pushes a snapshot on connect, so a replacement socket re-reads the stored transcript — and
-that read is a round trip of its own: it can be issued before a turn is persisted and land after the
-socket has already delivered the finished answer. The default merges by id with the stored copy
-winning and anything only on screen kept after it. Pass your own policy to decide differently.
+`AIChatAgent` pushes no snapshot on connect, so a replacement socket re-reads the stored transcript,
+unless `resyncOnReconnect` is off — and that read is a round trip of its own: it can be issued
+before a turn is persisted and land after the socket has already delivered the finished answer. The
+default merges by id with the stored copy winning and anything only on screen kept after it. Pass
+your own policy to decide differently.
 
 ```ts
 import type { UIMessage } from "ai";
@@ -151,6 +153,27 @@ useAgentChat({
       ...onScreen.filter((message) => !storedIds.has(message.id)),
     ];
   },
+});
+```
+
+### `resyncOnReconnect` — a server that pushes its own snapshot
+
+`AIChatAgent` sends a connecting client nothing of the transcript, which is why a replacement socket
+re-reads `get-messages`. A server that sends each connection its stored transcript as it opens, as a
+`cf_agent_chat_messages` frame, makes that read a second copy of the same transcript. With
+`resyncOnReconnect: false` a replacement socket reads nothing, and the frame is applied as any
+broadcast is, as a replace: `mergeMessages` is never called, so a merge of your own belongs in
+`onFrame`.
+
+Only a reconnect is affected. The first open's `get-messages` seed runs unless `initialMessages` is
+passed, with this option on or off, so a client whose server pushes the transcript on every
+connection passes both:
+
+```ts
+useAgentChat({
+  client: { /* ... */ },
+  initialMessages: [], // no read on the first open
+  resyncOnReconnect: false, // and none on a reconnect
 });
 ```
 

@@ -1443,7 +1443,7 @@ describe("useAgentChat — minting a message id", () => {
   });
 });
 
-// ── the three options an application wires ──────────────────────
+// ── the four options an application wires ───────────────────────
 
 describe("useAgentChat — onFrame", () => {
   it("sees every frame before the protocol does, and consumes the ones it claims", async () => {
@@ -1489,6 +1489,66 @@ describe("useAgentChat — mergeMessages", () => {
 
     expect(merge).toHaveBeenCalledTimes(1);
     expect(chat.chat.messages).toEqual(stored);
+    vi.unstubAllGlobals();
+    unmount();
+  });
+});
+
+describe("useAgentChat — resyncOnReconnect", () => {
+  const getMessagesUrl = "http://localhost:9999/agents/test-agent/test/get-messages";
+  const stored = [userMessage("hi"), assistantMessage("stored answer", "a-stored")];
+
+  /** Answers every `get-messages` read with `stored`, and returns the URLs read so far. */
+  function stubGetMessages(): () => string[] {
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(new Response(JSON.stringify(stored))));
+    vi.stubGlobal("fetch", fetchMock);
+    return () => fetchMock.mock.calls.map(([url]) => url);
+  }
+
+  async function settle(done: () => boolean = () => false) {
+    for (let i = 0; i < 8 && !done(); i++) {
+      await tick();
+    }
+  }
+
+  it("re-reads get-messages on a replacement socket by default", async () => {
+    const readUrls = stubGetMessages();
+    const { chat, client, unmount } = mountChat({ initialMessages: [userMessage("hi")], resume: false });
+
+    client.emit("open", new Event("open"));
+    await settle();
+    expect(readUrls()).toEqual([]);
+
+    client.emit("close", new CloseEvent("close"));
+    client.emit("open", new Event("open"));
+    await settle(() => chat.chat.messages.length === stored.length);
+
+    expect(readUrls()).toEqual([getMessagesUrl]);
+    expect(chat.chat.messages).toEqual(stored);
+    vi.unstubAllGlobals();
+    unmount();
+  });
+
+  it("reads nothing on a replacement socket when false, and takes the transcript the server pushes", async () => {
+    const readUrls = stubGetMessages();
+    const merge = vi.fn((onScreen: UIMessage[]) => onScreen);
+    const { chat, client, unmount } = mountChat({ resyncOnReconnect: false, mergeMessages: merge, resume: false });
+
+    // The first open is not a reconnect, so its seed still reads.
+    client.emit("open", new Event("open"));
+    await settle(() => chat.chat.messages.length > 0);
+    expect(readUrls()).toEqual([getMessagesUrl]);
+    expect(chat.chat.messages).toEqual(stored);
+
+    const pushed = [...stored, userMessage("asked elsewhere", "u2"), assistantMessage("answered", "a2")];
+    client.emit("close", new CloseEvent("close"));
+    client.emit("open", new Event("open"));
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: pushed });
+    await settle();
+
+    expect(readUrls()).toEqual([getMessagesUrl]);
+    expect(merge).not.toHaveBeenCalled();
+    expect(chat.chat.messages).toEqual(pushed);
     vi.unstubAllGlobals();
     unmount();
   });
