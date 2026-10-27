@@ -408,11 +408,11 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   const fallbackAckedResumeRequestIds = new Set<string>();
   let streamState: BroadcastStreamState = { status: "idle" };
   /**
-   * A stream this socket ACKed through the resume fallback and has had no chunk of yet. Upstream's
+   * A stream this socket ACKed through the resume fallback and has had no frame of yet. Upstream's
    * fallback builds its accumulator before knowing whether the stream continues the last assistant,
-   * and only a replayed `start` rebuilds it; one whose first chunk arrives live — offered before any
-   * was stored — would otherwise append a continuation, whose `start` carries no message id, as a
-   * second assistant.
+   * and only a replayed `start` rebuilds it. A stream offered before any chunk was stored replays
+   * none, only the control frame ending the replay, so without this its continuation — whose `start`
+   * carries no message id — lands as a second assistant beside the one it continues.
    */
   let unreadFallbackStreamId: string | null = null;
   let isResumingToolContinuation = false;

@@ -1098,9 +1098,18 @@ describe("useAgentChat — resume fallback dedupe", () => {
       initialMessages: [userMessage("Summarise it", "u1"), assistantMessage("Reading the pages.", "a-kept")],
     });
 
-    // Offered before any chunk is stored, so nothing is replayed and the first chunk arrives
-    // live — a continuation's `start`, whose message id the server strips.
+    // Offered before any chunk is stored: the ACK replays nothing but the control frame that
+    // ends the replay, and the stream goes on live — a continuation's `start` first, whose
+    // message id the server strips.
     client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    client.emitMessage({
+      type: "cf_agent_use_chat_response",
+      id: "rerun",
+      body: "",
+      replay: true,
+      replayComplete: true,
+      continuation: true,
+    });
     for (const chunk of [
       { type: "start" },
       { type: "text-start", id: "t2" },
