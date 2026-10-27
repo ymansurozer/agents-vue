@@ -407,6 +407,14 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   // ACK each at most once per socket; reset on close/dispose. Matches upstream 0.8.5.
   const fallbackAckedResumeRequestIds = new Set<string>();
   let streamState: BroadcastStreamState = { status: "idle" };
+  /**
+   * A stream this socket ACKed through the resume fallback and has had no chunk of yet. Upstream's
+   * fallback builds its accumulator before knowing whether the stream continues the last assistant,
+   * and only a replayed `start` rebuilds it; one whose first chunk arrives live — offered before any
+   * was stored — would otherwise append a continuation, whose `start` carries no message id, as a
+   * second assistant.
+   */
+  let unreadFallbackStreamId: string | null = null;
   let isResumingToolContinuation = false;
   /** Whether a continuation has been armed but not yet launched. */
   let pendingToolContinuation = false;
@@ -828,6 +836,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
               messageId: createMessageId(),
             });
             streamState = resumed.state;
+            unreadFallbackStreamId = data.id;
             isServerStreaming.value = resumed.isStreaming;
             // ACK this offer at most once per socket (else a duplicate offer replays the
             // chunk buffer twice). Track the observed turn so an explicit stop() can cancel
@@ -875,6 +884,14 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
             // registers one this tab only watches.
             if (!data.done && !data.error && transport.activeServerTurnId !== data.id) {
               transport.observeServerTurn(data.id);
+            }
+
+            if (unreadFallbackStreamId === data.id) {
+              unreadFallbackStreamId = null;
+
+              if (data.continuation && streamState.status === "observing" && streamState.streamId === data.id) {
+                streamState = { status: "idle" };
+              }
             }
 
             const chunkData = data.body?.trim() ? JSON.parse(data.body) : undefined;
