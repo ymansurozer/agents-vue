@@ -1092,6 +1092,46 @@ describe("useAgentChat — resume fallback dedupe", () => {
     expect(acks).toHaveLength(2);
     unmount();
   });
+
+  it("continues the last assistant when a resumed stream turns out to be a continuation", () => {
+    const { chat, client, unmount } = mountChat({
+      initialMessages: [userMessage("Summarise it", "u1"), assistantMessage("Reading the pages.", "a-kept")],
+    });
+
+    // Offered before any chunk is stored: the ACK replays nothing but the control frame that
+    // ends the replay, and the stream goes on live — a continuation's `start` first, whose
+    // message id the server strips.
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    client.emitMessage({
+      type: "cf_agent_use_chat_response",
+      id: "rerun",
+      body: "",
+      replay: true,
+      replayComplete: true,
+      continuation: true,
+    });
+    for (const chunk of [
+      { type: "start" },
+      { type: "text-start", id: "t2" },
+      { type: "text-delta", id: "t2", delta: "Done reading." },
+      { type: "text-end", id: "t2" },
+    ]) {
+      client.emitMessage({
+        type: "cf_agent_use_chat_response",
+        id: "rerun",
+        continuation: true,
+        body: JSON.stringify(chunk),
+      });
+    }
+
+    const assistants = chat.chat.messages.filter((m) => m.role === "assistant");
+    expect(assistants.map((m) => m.id)).toEqual(["a-kept"]);
+    expect(assistants[0]!.parts.flatMap((p) => (p.type === "text" ? [p.text] : []))).toEqual([
+      "Reading the pages.",
+      "Done reading.",
+    ]);
+    unmount();
+  });
 });
 
 // ── reconnect resume serialization (#1837) ──────────────────────

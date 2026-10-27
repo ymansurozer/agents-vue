@@ -1,6 +1,12 @@
 # Changelog
 
 
+## Unreleased
+
+### 🩹 Fixes
+
+- A stream a socket picks up through the resume fallback now extends the last assistant message when it turns out to be a continuation, rather than appending a second one. The fallback builds its accumulator before knowing what the stream is, and `agents` rebuilds it only for a replayed `start`; a stream offered before any chunk was stored replays only the control frame that ends the replay, and a continuation's `start` carries no message id, so the reply landed under a random id beside the message it continues. Seen when a server re-runs an interrupted turn with `continueLastTurn` while a tab is reconnecting.
+
 ## v0.5.0
 
 [compare changes](https://github.com/ymansurozer/agents-vue/compare/v0.4.0...v0.5.0)
