@@ -1569,9 +1569,9 @@ describe("useAgentChat — resyncOnReconnect", () => {
     unmount();
   });
 
-  it("reads nothing on a replacement socket when false, and takes the transcript the server pushes", async () => {
+  it("reads nothing on a replacement socket when false, and merges the transcript the server pushes", async () => {
     const readUrls = stubGetMessages();
-    const merge = vi.fn((onScreen: UIMessage[]) => onScreen);
+    const merge = vi.fn((_onScreen: UIMessage[], pushedTranscript: UIMessage[]) => pushedTranscript);
     const { chat, client, unmount } = mountChat({ resyncOnReconnect: false, mergeMessages: merge, resume: false });
 
     // The first open is not a reconnect, so its seed still reads.
@@ -1587,7 +1587,8 @@ describe("useAgentChat — resyncOnReconnect", () => {
     await settle();
 
     expect(readUrls()).toEqual([getMessagesUrl]);
-    expect(merge).not.toHaveBeenCalled();
+    expect(merge).toHaveBeenCalledTimes(1);
+    expect(merge.mock.calls[0]?.[1]).toEqual(pushed);
     expect(chat.chat.messages).toEqual(pushed);
     vi.unstubAllGlobals();
     unmount();
@@ -2260,6 +2261,197 @@ describe("useAgentChat — a turn re-run while the socket was away", () => {
 
     expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
     expect(texts(assistants(chat)[0])).toEqual(["Starting.", "Going on."]);
+    unmount();
+  });
+
+  /** Sends a question and answers with the request id the client gave it. */
+  async function sendAndRequest(chat: ReturnType<typeof useAgentChat>, client: MockClientLike): Promise<string> {
+    void chat.chat.sendMessage({ text: "Prepare a brief" });
+    let request: { id: string } | undefined;
+    for (let i = 0; i < 8 && !request; i++) {
+      await tick();
+      request = client.lastSentOfType<{ id: string }>("cf_agent_use_chat_request");
+    }
+    return request!.id;
+  }
+
+  const userTurn = (chat: ReturnType<typeof useAgentChat>) => chat.chat.messages.filter((m) => m.role === "user");
+
+  it("keeps text a replay drew before a second drop cut it short", async () => {
+    const { chat, client, unmount } = mountChat({
+      onError: () => {},
+      resyncOnReconnect: false,
+      initialMessages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+
+    await openAndProbe(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    respond(client, "rerun", { type: "start" }, { replay: true, seq: 0 });
+    respond(client, "rerun", { type: "text-start", id: "t9" }, { replay: true, seq: 1 });
+    respond(client, "rerun", { type: "text-delta", id: "t9", delta: "Replayed." }, { replay: true, seq: 2 });
+    await settle();
+
+    // The socket drops before the replay ends, so none of it reached the transcript.
+    client.emit("close", new CloseEvent("close"));
+    await openAndProbe(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: [userMessage("Prepare a brief", "u1"), committedReply()] });
+    respond(client, "rerun", { type: "start" }, { replay: true, seq: 0 });
+    respond(client, "rerun", { type: "text-start", id: "t9" }, { replay: true, seq: 1 });
+    respond(client, "rerun", { type: "text-delta", id: "t9", delta: "Replayed." }, { replay: true, seq: 2 });
+    endReplay(client, "rerun");
+    respond(client, "rerun", { type: "text-delta", id: "t9", delta: " Live." }, { seq: 3 });
+    await settle();
+
+    expect(texts(assistants(chat)[0])).toEqual(["Starting.", "Replayed. Live."]);
+    unmount();
+  });
+
+  it("keeps a part a transcript adds to the streaming reply when the turn's end follows it", async () => {
+    const { chat, client, unmount } = mountChat({
+      onError: () => {},
+      initialMessages: [userMessage("Prepare a brief", "u1"), assistantMessage("Base.", "a-reply")],
+    });
+
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    endReplay(client, "rerun");
+    respond(client, "rerun", { type: "start" }, { seq: 0 });
+    respond(client, "rerun", { type: "text-start", id: "t9" }, { seq: 1 });
+    respond(client, "rerun", { type: "text-delta", id: "t9", delta: "Answer." }, { seq: 2 });
+    await settle();
+
+    // The same text, and one part this client never drew.
+    const stored: UIMessage = { ...assistants(chat)[0]!, parts: [...assistants(chat)[0]!.parts, progressReport] };
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: [userMessage("Prepare a brief", "u1"), stored] });
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: "rerun", body: "", done: true, continuation: true });
+    await settle();
+
+    expect(partTypes(assistants(chat)[0])).toContain("data-progress");
+    expect(texts(assistants(chat)[0])).toEqual(["Base.", "Answer."]);
+    unmount();
+  });
+
+  it("keeps one reply, with no text twice, when the socket blips under the client's own turn", async () => {
+    const { chat, client, unmount } = mountChat({ onError: () => {}, resyncOnReconnect: false });
+
+    await openAndProbe(client);
+    const probe = client.lastSentOfType<{ probeId: string }>("cf_agent_stream_resume_request");
+    client.emitMessage({ type: "cf_agent_stream_resume_none", probeId: probe?.probeId });
+    await settle();
+
+    const sent = await sendAndRequest(chat, client);
+    const own = (chunk: unknown, extra: Record<string, unknown> = {}) => respond(client, sent, chunk, { continuation: false, ...extra });
+    own({ type: "start", messageId: "a-reply" }, { seq: 0 });
+    own({ type: "text-start", id: "t1" }, { seq: 1 });
+    own({ type: "text-delta", id: "t1", delta: "The fee is" }, { seq: 2 });
+    await settle();
+
+    client.emit("close", new CloseEvent("close"));
+    await settle();
+    await openAndProbe(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: sent });
+    // Storage holds the question; the reply is not written until the turn ends.
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: userTurn(chat) });
+    own({ type: "start", messageId: "a-reply" }, { replay: true, seq: 0 });
+    own({ type: "text-start", id: "t1" }, { replay: true, seq: 1 });
+    own({ type: "text-delta", id: "t1", delta: "The fee is" }, { replay: true, seq: 2 });
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: sent, body: "", replay: true, replayComplete: true });
+    own({ type: "text-delta", id: "t1", delta: " four hundred dollars." }, { seq: 3 });
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(texts(assistants(chat)[0])).toEqual(["The fee is four hundred dollars."]);
+    expect(chat.chat.status).not.toBe("error");
+    unmount();
+  });
+
+  /** A run observed from the start that draws a step it never commits, then dies with the socket. */
+  async function drawDeadStep(client: MockClientLike) {
+    await openAndProbe(client);
+    const probe = client.lastSentOfType<{ probeId: string }>("cf_agent_stream_resume_request");
+    client.emitMessage({ type: "cf_agent_stream_resume_none", probeId: probe?.probeId });
+    await settle();
+
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "first-run" });
+    endReplay(client, "first-run");
+    respond(client, "first-run", { type: "start" }, { seq: 0 });
+    respond(client, "first-run", { type: "text-start", id: "t2" }, { seq: 1 });
+    respond(client, "first-run", { type: "text-delta", id: "t2", delta: "Words the re-run writes again." }, { seq: 2 });
+    await settle();
+    client.emit("close", new CloseEvent("close"));
+    await openAndProbe(client);
+  }
+
+  function rerunsTheDeadStep(client: MockClientLike) {
+    respond(client, "rerun", { type: "start" }, { replay: true, seq: 0 });
+    endReplay(client, "rerun");
+    respond(client, "rerun", { type: "text-start", id: "t9" }, { seq: 1 });
+    respond(client, "rerun", { type: "text-delta", id: "t9", delta: "Words the re-run writes again." }, { seq: 2 });
+  }
+
+  it("shows a re-run's step once when storage arrives before the re-run is offered", async () => {
+    const { chat, client, unmount } = mountChat({
+      onError: () => {},
+      resyncOnReconnect: false,
+      initialMessages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+
+    await drawDeadStep(client);
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: [userMessage("Prepare a brief", "u1"), committedReply()] });
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    rerunsTheDeadStep(client);
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(texts(assistants(chat)[0])).toEqual(["Starting.", "Words the re-run writes again."]);
+    unmount();
+  });
+
+  it("shows a re-run's step once when its chunks arrive before storage", async () => {
+    const { chat, client, unmount } = mountChat({
+      onError: () => {},
+      resyncOnReconnect: false,
+      initialMessages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+
+    await drawDeadStep(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    rerunsTheDeadStep(client);
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: [userMessage("Prepare a brief", "u1"), committedReply()] });
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(texts(assistants(chat)[0])).toEqual(["Starting.", "Words the re-run writes again."]);
+    unmount();
+  });
+
+  it("drops a reply a dead run drew before storage held any of it, when the turn runs again", async () => {
+    const { chat, client, unmount } = mountChat({ onError: () => {}, resyncOnReconnect: false });
+
+    await openAndProbe(client);
+    const probe = client.lastSentOfType<{ probeId: string }>("cf_agent_stream_resume_request");
+    client.emitMessage({ type: "cf_agent_stream_resume_none", probeId: probe?.probeId });
+    await settle();
+
+    const sent = await sendAndRequest(chat, client);
+    respond(client, sent, { type: "start", messageId: "a-reply" }, { continuation: false, seq: 0 });
+    respond(client, sent, { type: "text-start", id: "t1" }, { continuation: false, seq: 1 });
+    respond(client, sent, { type: "text-delta", id: "t1", delta: "Words the" }, { continuation: false, seq: 2 });
+    await settle();
+    client.emit("close", new CloseEvent("close"));
+    await settle();
+
+    await openAndProbe(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: userTurn(chat) });
+    respond(client, "rerun", { type: "start", messageId: "a-reply" }, { continuation: false, replay: true, seq: 0 });
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: "rerun", body: "", replay: true, replayComplete: true });
+    respond(client, "rerun", { type: "text-start", id: "t9" }, { continuation: false, seq: 1 });
+    respond(client, "rerun", { type: "text-delta", id: "t9", delta: "Words the re-run writes." }, { continuation: false, seq: 2 });
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(texts(assistants(chat)[0])).toEqual(["Words the re-run writes."]);
     unmount();
   });
 
