@@ -1909,3 +1909,374 @@ describe("useAgentChat — sendOnlyNewMessages", () => {
     unmount();
   });
 });
+
+// ── a turn the server re-ran while this client's socket was away ──
+//
+// A deploy or an eviction ends a turn's stream mid-way, and the server runs the turn again under a
+// new request id, continuing the assistant message it had already stored. Which arrives first — the
+// re-run or this client's replacement socket — decides how the client learns of it, and the reply
+// has to stay one message either way.
+
+describe("useAgentChat — a turn re-run while the socket was away", () => {
+  const researchCall = {
+    type: "tool-research",
+    toolCallId: "call-research",
+    state: "output-available",
+    input: { brief: "Find the filing" },
+    output: { found: true },
+  } as UIMessage["parts"][number];
+  const progressReport = { type: "data-progress", id: "progress-1", data: { done: 1 } } as UIMessage["parts"][number];
+
+  /** The reply as storage holds it after the steps the dead run committed. */
+  const committedReply = (): UIMessage => ({
+    id: "a-reply",
+    role: "assistant",
+    parts: [{ type: "text", text: "Starting.", state: "done" }, researchCall, progressReport],
+  });
+
+  function respond(client: MockClientLike, id: string, chunk: unknown, extra: Record<string, unknown> = {}) {
+    client.emitMessage({
+      type: "cf_agent_use_chat_response",
+      id,
+      body: JSON.stringify(chunk),
+      continuation: true,
+      ...extra,
+    });
+  }
+
+  function endReplay(client: MockClientLike, id: string) {
+    client.emitMessage({
+      type: "cf_agent_use_chat_response",
+      id,
+      body: "",
+      replay: true,
+      replayComplete: true,
+      continuation: true,
+    });
+  }
+
+  function finish(client: MockClientLike, id: string) {
+    respond(client, id, { type: "finish" });
+    client.emitMessage({ type: "cf_agent_use_chat_response", id, body: "", done: true, continuation: true });
+  }
+
+  /** Opens the socket and waits for the resume probe that opening sends. */
+  async function openAndProbe(client: MockClientLike): Promise<void> {
+    const probes = () => client.sent<{ type: string }>().filter((m) => m.type === "cf_agent_stream_resume_request").length;
+    const before = probes();
+    client.emit("open", new Event("open"));
+    for (let i = 0; i < 8 && probes() === before; i++) {
+      await tick();
+    }
+    expect(probes()).toBe(before + 1);
+  }
+
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 4; i++) {
+      await tick();
+    }
+  }
+
+  const assistants = (chat: ReturnType<typeof useAgentChat>) => chat.chat.messages.filter((m) => m.role === "assistant");
+  const partTypes = (message: UIMessage | undefined) => message?.parts.map((part) => part.type) ?? [];
+  const texts = (message: UIMessage | undefined) =>
+    message?.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])) ?? [];
+
+  /** The re-run's opening replay (its `start` and first step), then its first live step. */
+  function rerunUpToALiveCheck(client: MockClientLike, id: string) {
+    respond(client, id, { type: "start" }, { replay: true, seq: 0 });
+    respond(client, id, { type: "start-step" }, { replay: true, seq: 1 });
+    endReplay(client, id);
+    respond(client, id, { type: "reasoning-start", id: "r1" }, { seq: 2 });
+    respond(client, id, { type: "reasoning-delta", id: "r1", delta: "Checking the length." }, { seq: 3 });
+    respond(client, id, { type: "reasoning-end", id: "r1" }, { seq: 4 });
+    respond(
+      client,
+      id,
+      { type: "tool-input-available", toolCallId: "call-check", toolName: "check", input: { what: "length" } },
+      { seq: 5 },
+    );
+    respond(client, id, { type: "tool-output-available", toolCallId: "call-check", output: { ok: true } }, { seq: 6 });
+    respond(client, id, { type: "text-start", id: "t9" }, { seq: 7 });
+    respond(client, id, { type: "text-delta", id: "t9", delta: "Here is the brief." }, { seq: 8 });
+    respond(client, id, { type: "text-end", id: "t9" }, { seq: 9 });
+  }
+
+  it("keeps one reply when the re-run is live before the socket opens", async () => {
+    const { chat, client, unmount } = mountChat({
+      onError: () => {},
+      initialMessages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+
+    await openAndProbe(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    rerunUpToALiveCheck(client, "rerun");
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(partTypes(assistants(chat)[0])).toEqual(
+      expect.arrayContaining(["tool-research", "data-progress", "reasoning", "tool-check"]),
+    );
+    expect(chat.chat.status).not.toBe("error");
+
+    finish(client, "rerun");
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(texts(assistants(chat)[0])).toEqual(["Starting.", "Here is the brief."]);
+    unmount();
+  });
+
+  it("keeps one reply when the socket opens before the re-run starts", async () => {
+    const { chat, client, unmount } = mountChat({
+      onError: () => {},
+      initialMessages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+
+    await openAndProbe(client);
+    const probe = client.lastSentOfType<{ probeId: string }>("cf_agent_stream_resume_request");
+    client.emitMessage({ type: "cf_agent_stream_resume_none", probeId: probe?.probeId });
+    await settle();
+
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    rerunUpToALiveCheck(client, "rerun");
+    finish(client, "rerun");
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(texts(assistants(chat)[0])).toEqual(["Starting.", "Here is the brief."]);
+    unmount();
+  });
+
+  it("leaves the whole reply when the stored copy and the end of the turn land in one tick", async () => {
+    const { chat, client, unmount } = mountChat({
+      onError: () => {},
+      initialMessages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+
+    await openAndProbe(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    rerunUpToALiveCheck(client, "rerun");
+    await settle();
+
+    // The server persists the reply as the stream ends: the transcript frame lands between the
+    // stream's last chunk and its `done`, with nothing in between for the screen to settle on.
+    const stored: UIMessage = {
+      ...committedReply(),
+      parts: [
+        ...committedReply().parts,
+        { type: "reasoning", text: "Checking the length.", state: "done" },
+        {
+          type: "tool-check",
+          toolCallId: "call-check",
+          state: "output-available",
+          input: { what: "length" },
+          output: { ok: true },
+        } as UIMessage["parts"][number],
+        { type: "text", text: "Here is the brief.", state: "done" },
+      ],
+    };
+    respond(client, "rerun", { type: "finish" });
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: [userMessage("Prepare a brief", "u1"), stored] });
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: "rerun", body: "", done: true, continuation: true });
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(partTypes(assistants(chat)[0])).toEqual(
+      expect.arrayContaining(["tool-research", "data-progress", "reasoning", "tool-check"]),
+    );
+    unmount();
+  });
+
+  it("never gives a reply's id to a copy holding less of it", async () => {
+    const { chat, client, unmount } = mountChat({
+      initialMessages: [userMessage("Prepare a brief", "u1")],
+    });
+
+    // A turn this client watches from its start, under the id it minted for it.
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "watched" });
+    respond(client, "watched", { type: "start" }, { continuation: false });
+    respond(
+      client,
+      "watched",
+      { type: "tool-input-available", toolCallId: "call-check", toolName: "check", input: { what: "length" } },
+      { continuation: false },
+    );
+    await settle();
+
+    // Storage holds the same reply under its own id, with work this client never saw.
+    const stored: UIMessage = {
+      id: "a-reply",
+      role: "assistant",
+      parts: [
+        researchCall,
+        progressReport,
+        {
+          type: "tool-check",
+          toolCallId: "call-check",
+          state: "input-available",
+          input: { what: "length" },
+        } as UIMessage["parts"][number],
+      ],
+    };
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: [userMessage("Prepare a brief", "u1"), stored] });
+    await settle();
+
+    expect(partTypes(assistants(chat).find((m) => m.id === "a-reply"))).toEqual(
+      expect.arrayContaining(["tool-research", "data-progress", "tool-check"]),
+    );
+    unmount();
+  });
+
+  it("keeps one reply, with no text twice, when the socket drops during a continuation", async () => {
+    const { chat, client, unmount } = mountChat({
+      onError: () => {},
+      resyncOnReconnect: false,
+      initialMessages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+
+    await openAndProbe(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    endReplay(client, "rerun");
+    respond(client, "rerun", { type: "start" }, { seq: 0 });
+    respond(client, "rerun", { type: "text-start", id: "t9" }, { seq: 1 });
+    respond(client, "rerun", { type: "text-delta", id: "t9", delta: "Live A." }, { seq: 2 });
+    await settle();
+
+    client.emit("close", new CloseEvent("close"));
+    await openAndProbe(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    // Storage has not caught up with the step the dropped socket was carrying.
+    client.emitMessage({
+      type: "cf_agent_chat_messages",
+      messages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+    respond(client, "rerun", { type: "start" }, { replay: true, seq: 0 });
+    respond(client, "rerun", { type: "text-start", id: "t9" }, { replay: true, seq: 1 });
+    respond(client, "rerun", { type: "text-delta", id: "t9", delta: "Live A." }, { replay: true, seq: 2 });
+    endReplay(client, "rerun");
+    respond(client, "rerun", { type: "text-delta", id: "t9", delta: " Live B." }, { seq: 3 });
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(texts(assistants(chat)[0])).toEqual(["Starting.", "Live A. Live B."]);
+    unmount();
+  });
+
+  it("shows a step's text once when a re-run writes again what a dead run already drew", async () => {
+    const { chat, client, unmount } = mountChat({
+      onError: () => {},
+      resyncOnReconnect: false,
+      initialMessages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+
+    await openAndProbe(client);
+    const probe = client.lastSentOfType<{ probeId: string }>("cf_agent_stream_resume_request");
+    client.emitMessage({ type: "cf_agent_stream_resume_none", probeId: probe?.probeId });
+    await settle();
+
+    // The first run draws a step it never commits, and dies with the socket.
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "first-run" });
+    endReplay(client, "first-run");
+    respond(client, "first-run", { type: "start" }, { seq: 0 });
+    respond(client, "first-run", { type: "text-start", id: "t2" }, { seq: 1 });
+    respond(client, "first-run", { type: "text-delta", id: "t2", delta: "Words the re-run writes again." }, { seq: 2 });
+    await settle();
+    client.emit("close", new CloseEvent("close"));
+
+    // The re-run is offered first, then storage's copy, which holds only the committed steps.
+    await openAndProbe(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    client.emitMessage({
+      type: "cf_agent_chat_messages",
+      messages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+    respond(client, "rerun", { type: "start" }, { replay: true, seq: 0 });
+    endReplay(client, "rerun");
+    respond(client, "rerun", { type: "text-start", id: "t9" }, { seq: 1 });
+    respond(client, "rerun", { type: "text-delta", id: "t9", delta: "Words the re-run writes again." }, { seq: 2 });
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(texts(assistants(chat)[0])).toEqual(["Starting.", "Words the re-run writes again."]);
+    unmount();
+  });
+
+  it("clears a socket-closed error once the turn is live again", async () => {
+    const { chat, client, unmount } = mountChat({ onError: () => {}, resume: false });
+
+    client.emit("open", new Event("open"));
+    void chat.chat.sendMessage({ text: "Prepare a brief" });
+    let request: { id: string } | undefined;
+    for (let i = 0; i < 8 && !request; i++) {
+      await tick();
+      request = client.lastSentOfType<{ id: string }>("cf_agent_use_chat_request");
+    }
+    respond(client, request!.id, { type: "start", messageId: "a-reply" }, { continuation: false });
+    respond(client, request!.id, { type: "text-start", id: "t1" }, { continuation: false });
+    respond(client, request!.id, { type: "text-delta", id: "t1", delta: "Starting." }, { continuation: false });
+    await settle();
+    client.emit("close", new CloseEvent("close"));
+    await settle();
+    expect(chat.chat.status).toBe("error");
+
+    client.emit("open", new Event("open"));
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    endReplay(client, "rerun");
+    respond(client, "rerun", { type: "start" }, { seq: 0 });
+    respond(client, "rerun", { type: "text-start", id: "t2" }, { seq: 1 });
+    respond(client, "rerun", { type: "text-delta", id: "t2", delta: "Going on." }, { seq: 2 });
+    await settle();
+
+    expect(chat.chat.status).not.toBe("error");
+    expect(chat.chat.error).toBeUndefined();
+    unmount();
+  });
+
+  it("keeps one reply when a stalled step is sent again on the same socket", async () => {
+    const { chat, client, unmount } = mountChat({ onError: () => {} });
+
+    client.emit("open", new Event("open"));
+    await settle();
+    void chat.chat.sendMessage({ text: "Prepare a brief" });
+    let request: { id: string } | undefined;
+    for (let i = 0; i < 8 && !request; i++) {
+      await tick();
+      request = client.lastSentOfType<{ id: string }>("cf_agent_use_chat_request");
+    }
+    respond(client, request!.id, { type: "start", messageId: "a-reply" }, { continuation: false });
+    respond(client, request!.id, { type: "text-start", id: "t1" }, { continuation: false });
+    respond(client, request!.id, { type: "text-delta", id: "t1", delta: "Starting." }, { continuation: false });
+    respond(client, request!.id, { type: "text-end", id: "t1" }, { continuation: false });
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: request!.id, body: "", done: true });
+    await settle();
+
+    // The server sends the step again under a request of its own, on the socket that never dropped.
+    respond(client, "retry", { type: "start" }, { seq: 0 });
+    respond(client, "retry", { type: "text-start", id: "t2" }, { seq: 1 });
+    respond(client, "retry", { type: "text-delta", id: "t2", delta: "Going on." }, { seq: 2 });
+    finish(client, "retry");
+    await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(texts(assistants(chat)[0])).toEqual(["Starting.", "Going on."]);
+    unmount();
+  });
+
+  it("stops a re-run the client came back to", async () => {
+    const { chat, client, unmount } = mountChat({
+      onError: () => {},
+      initialMessages: [userMessage("Prepare a brief", "u1"), committedReply()],
+    });
+
+    await openAndProbe(client);
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: "rerun" });
+    endReplay(client, "rerun");
+    await settle();
+
+    await chat.stop();
+
+    expect(client.lastSentOfType<{ id: string }>("cf_agent_chat_request_cancel")?.id).toBe("rerun");
+    unmount();
+  });
+});
