@@ -161,9 +161,9 @@ useAgentChat({
 `AIChatAgent` sends a connecting client nothing of the transcript, which is why a replacement socket
 re-reads `get-messages`. A server that sends each connection its stored transcript as it opens, as a
 `cf_agent_chat_messages` frame, makes that read a second copy of the same transcript. With
-`resyncOnReconnect: false` a replacement socket reads nothing, and the frame is applied as any
-broadcast is, as a replace: `mergeMessages` is never called, so a merge of your own belongs in
-`onFrame`.
+`resyncOnReconnect: false` a replacement socket reads nothing. The frames it is pushed are held until
+it knows what became of the stream it lost, at most three seconds, and the latest is merged through
+`mergeMessages` like a read; later ones are applied as any broadcast is.
 
 Only a reconnect is affected. The first open's `get-messages` seed runs unless `initialMessages` is
 passed, with this option on or off, so a client whose server pushes the transcript on every

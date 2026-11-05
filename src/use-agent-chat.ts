@@ -119,9 +119,12 @@ export interface UseAgentChatOptions<
   onFrame?: (frame: unknown) => boolean | void;
   /**
    * How a transcript read back from the server is merged into the one on screen, used for the stored
-   * transcript a replacement socket brings: its `get-messages` read, or the transcript the server
-   * pushes with `resyncOnReconnect: false`. A reply whose stream the server no longer runs is taken
-   * out of the screen's side first, since storage's copy of it is the whole of it.
+   * transcript a replacement socket brings: its `get-messages` read, or a transcript the server
+   * pushes before the socket learns what became of the stream it lost — the latest of them, once it
+   * does. A reply whose stream the server no longer runs is taken out of the screen's side first,
+   * since storage's copy of it is the whole of it; one whose stream carries on is passed with the
+   * screen's text and storage's tool calls, data parts and metadata, since its replay skips what the
+   * screen already shows.
    *
    * The read is a round trip of its own: it can be issued before a turn is persisted and land
    * after the socket has already delivered the finished answer, so replacing the transcript with
@@ -137,8 +140,9 @@ export interface UseAgentChatOptions<
    *
    * Set it to false against a server that sends its stored transcript to every connection as it
    * opens, as a `cf_agent_chat_messages` frame, where the read would fetch the same transcript a
-   * second time. A replacement socket's first such frame is then taken in place of the read, merged
-   * through `mergeMessages`; later ones are applied as any broadcast is.
+   * second time. A replacement socket then reads nothing: the frames it is pushed are held until it
+   * knows what became of the stream it lost, and the latest is merged through `mergeMessages`; later
+   * ones are applied as any broadcast is.
    *
    * Only a reconnect is affected. The first open's `get-messages` seed runs unless `initialMessages`
    * is passed, with this option on or off.
@@ -324,17 +328,50 @@ function getErrorText(error: unknown): string {
  * What a message holds that a copy of it can lose: its tool calls and its data parts. A data part is
  * known by its id, or by its contents when it has none.
  */
+function workKeyOf(part: UIMessage["parts"][number]): string | null {
+  if ("toolCallId" in part && typeof part.toolCallId === "string") {
+    return `tool:${part.toolCallId}`;
+  }
+  if (part.type.startsWith("data-")) {
+    const id = "id" in part && typeof part.id === "string" ? part.id : JSON.stringify("data" in part ? part.data : null);
+    return `${part.type}:${id}`;
+  }
+  return null;
+}
+
 function workKeysOf(message: UIMessage): Set<string> {
   const keys = new Set<string>();
   for (const part of message.parts) {
-    if ("toolCallId" in part && typeof part.toolCallId === "string") {
-      keys.add(`tool:${part.toolCallId}`);
-    } else if (part.type.startsWith("data-")) {
-      const id = "id" in part && typeof part.id === "string" ? part.id : JSON.stringify("data" in part ? part.data : null);
-      keys.add(`${part.type}:${id}`);
+    const key = workKeyOf(part);
+    if (key !== null) {
+      keys.add(key);
     }
   }
   return keys;
+}
+
+/**
+ * `shown` with the tool calls, data parts and metadata only `stored` holds. Its text stands: a stream
+ * that carries on replays what the screen lacks of it, and skips what the screen already has.
+ */
+function withStoredWork<ChatMessage extends UIMessage>(shown: ChatMessage, stored: ChatMessage): ChatMessage {
+  const held = workKeysOf(shown);
+  const added = stored.parts.filter((part) => {
+    const key = workKeyOf(part);
+    return key !== null && !held.has(key);
+  });
+  const metadata =
+    isRecord(stored.metadata) || isRecord(shown.metadata) ? { ...asRecord(stored.metadata), ...asRecord(shown.metadata) } : undefined;
+
+  return {
+    ...shown,
+    parts: [...shown.parts, ...added],
+    ...(metadata !== undefined && { metadata }),
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
 }
 
 /** Whether `copy` holds every tool call and data part `other` does. */
@@ -390,9 +427,9 @@ function preserveActiveStreamMessages<ChatMessage extends UIMessage>(
 }
 
 /**
- * How long a replacement socket waits for the stored transcript and for word of the stream it lost
- * before it applies what it has: a server that pushes no transcript, or a client that sends no probe,
- * would otherwise hold the stream's frames for good.
+ * How long a replacement socket holds the screen for the stored transcript and for word of the stream
+ * it lost before it shows what it has: a server that pushes no transcript, or a probe the server is
+ * slow to answer, would otherwise hold it for good. A late answer still settles the lost stream.
  */
 const RECONNECT_SETTLE_MS = 3_000;
 
@@ -461,23 +498,27 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   /** The stream whose chunks this client received last, until its terminal frame. */
   let drawingStreamId: string | null = null;
   /**
-   * What a dropped socket leaves to settle, from its close until the replacement knows both how the
-   * stream it lost relates to what the server runs now and what storage holds. Settled once, in
-   * `settleReconnect`, before any of the server's stream frames are applied, so a continuation never
-   * takes in a dead stream's half of a step that storage is about to replace.
+   * What a dropped socket leaves to settle, from its close until the replacement knows how the stream
+   * it lost relates to what the server runs now. Until then the screen is held: transcripts and the
+   * server's stream frames wait here, and are applied in `settleReconnect` once storage has answered
+   * too, so a continuation never takes in a dead stream's half of a step that storage is about to
+   * replace. The deadline releases the hold but keeps the record while the offer is unknown, so a
+   * late offer still settles the lost stream before its replay is drawn.
    *
    * - `lost`: the stream that was writing when the socket closed, and the message it was writing.
    * - `offered`: the stream the replacement learned of — its probe's answer, an unprompted offer, or
    *   a stream's first frame — `null` once it knows there is none, `undefined` until then.
-   * - `snapshot`: the stored transcript — the `get-messages` read, or the first transcript frame with
-   *   `resyncOnReconnect: false` — `null` when the read failed, `undefined` until it lands.
+   * - `snapshot`: the latest stored transcript — the `get-messages` read or a transcript frame —
+   *   `null` when the read failed, `undefined` until one lands.
    * - `frames`: the server stream frames held meanwhile.
+   * - `released`: the deadline passed, so what arrives is applied at once.
    */
   let reconnect: {
     lost: { streamId: string; messageId: string } | null;
     offered: string | null | undefined;
     snapshot: ChatMessage[] | null | undefined;
     frames: ProtocolMessage<ChatMessage>[];
+    released: boolean;
   } | null = null;
   let reconnectDeadline: ReturnType<typeof setTimeout> | null = null;
   /**
@@ -760,6 +801,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     streamState = broadcastTransition(streamState, { type: "clear" }).state;
     chat.messages = [];
     heldMessageIds = [];
+    forgetReconnect();
     socket.send(JSON.stringify({ type: "cf_agent_chat_clear" }));
   }
 
@@ -974,22 +1016,24 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   }
 
   /**
-   * Settles what a dropped socket left once the replacement knows enough — or, `force`d at the
-   * deadline, with whatever it has — and then applies the stream frames held meanwhile.
+   * Settles what a dropped socket left once the replacement knows enough, then applies the stream
+   * frames held meanwhile. Released by the deadline, it shows what is known each time something
+   * arrives, and ends once the offer is known: a stream drawn from then on cannot be settled again.
    */
-  function settleReconnect(force = false) {
+  function settleReconnect() {
     const pending = reconnect;
     if (!pending) {
       return;
     }
 
-    const known = pending.snapshot !== undefined && (pending.lost === null || pending.offered !== undefined);
-    if (!known && !force) {
+    const offerKnown = pending.lost === null || pending.offered !== undefined;
+    if (!pending.released && !(offerKnown && pending.snapshot !== undefined)) {
       return;
     }
 
-    reconnect = null;
-    clearReconnectDeadline();
+    if (offerKnown) {
+      forgetReconnect();
+    }
 
     const { lost, offered, snapshot } = pending;
     const lostStreamGone = lost !== null && offered !== undefined && offered !== lost.streamId;
@@ -1005,7 +1049,8 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
       followTranscript();
     }
 
-    for (const frame of pending.frames) {
+    const frames = pending.frames.splice(0);
+    for (const frame of frames) {
       if (frame.id) {
         applyServerStreamFrame(frame.id, frame);
       }
@@ -1014,9 +1059,11 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
 
   /**
    * The screen after a reconnect, from what it showed and what storage holds. A stream that carries
-   * on is ahead of storage, so the screen's copy of its message stands; one that is gone drew past
-   * storage only a step the server writes again, if at all, so storage's copy is the whole message —
-   * and where storage holds none of it, there is no message.
+   * on can be ahead of storage, and its replay skips the chunks the screen already has, so the
+   * screen's copy of its message keeps its text, taking from storage's copy the tool calls, data
+   * parts and metadata it lacks; one that is gone (or not yet known to carry on) drew past storage
+   * only a step the server writes again, if at all, so storage's copy is the whole message — and
+   * where storage holds none of it, there is no message.
    */
   function reconciledTranscript(
     onScreen: ChatMessage[],
@@ -1040,11 +1087,12 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     const shown = onScreen.find((message) => message.id === lost.messageId);
     return merge(
       onScreen,
-      shown ? stored.map((message) => (message.id === lost.messageId ? shown : message)) : stored,
+      shown ? stored.map((message) => (message.id === lost.messageId ? withStoredWork(shown, message) : message)) : stored,
     );
   }
 
-  function clearReconnectDeadline() {
+  function forgetReconnect() {
+    reconnect = null;
     if (reconnectDeadline !== null) {
       clearTimeout(reconnectDeadline);
       reconnectDeadline = null;
@@ -1068,7 +1116,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
       switch (data.type) {
         // Full message list sync (sent on connect, and after every appendMessage / turn).
         case "cf_agent_chat_messages":
-          if (reconnect && reconnect.snapshot === undefined && options.resyncOnReconnect === false) {
+          if (reconnect) {
             reconnect.snapshot = data.messages ?? [];
             settleReconnect();
             break;
@@ -1092,6 +1140,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
 
         // Clear all messages
         case "cf_agent_chat_clear":
+          forgetReconnect();
           streamState = broadcastTransition(streamState, { type: "clear" }).state;
           chat.messages = [];
           heldMessageIds = [];
@@ -1219,8 +1268,12 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     void seedInitialMessages();
 
     if (reconnect) {
-      clearReconnectDeadline();
-      reconnectDeadline = setTimeout(() => settleReconnect(true), RECONNECT_SETTLE_MS);
+      const pending = reconnect;
+      reconnectDeadline = setTimeout(() => {
+        reconnectDeadline = null;
+        pending.released = true;
+        settleReconnect();
+      }, RECONNECT_SETTLE_MS);
     }
 
     if (resyncPending) {
@@ -1282,8 +1335,8 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
       (drawingStreamId !== null && lastAssistantId !== undefined
         ? { streamId: drawingStreamId, messageId: lastAssistantId }
         : null);
-    reconnect = { lost, offered: undefined, snapshot: undefined, frames: [] };
-    clearReconnectDeadline();
+    forgetReconnect();
+    reconnect = { lost, offered: undefined, snapshot: undefined, frames: [], released: false };
     drawingStreamId = null;
     unpublishedReplaySeqs.clear();
     isRecovering.value = false;
@@ -1301,7 +1354,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   // Cleanup on scope disposal
   onScopeDispose(() => {
     fallbackAckedResumeRequestIds.clear();
-    clearReconnectDeadline();
+    forgetReconnect();
     resetToolContinuation();
     isRecovering.value = false;
     // Force the resume gate open and bump the generation so any orphaned in-flight
@@ -1370,8 +1423,8 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   async function resyncMessages() {
     const stored = await fetchStoredMessages();
 
-    if (reconnect && reconnect.snapshot === undefined) {
-      reconnect.snapshot = stored;
+    if (reconnect) {
+      reconnect.snapshot = stored ?? reconnect.snapshot ?? null;
       settleReconnect();
       return;
     }
