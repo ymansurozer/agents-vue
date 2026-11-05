@@ -1,6 +1,25 @@
 # Changelog
 
 
+## v0.6.0
+
+[compare changes](https://github.com/ymansurozer/agents-vue/compare/v0.5.1...v0.6.0)
+
+### ⚠️ Contract changes
+
+- With `resyncOnReconnect: false`, the transcript a replacement socket is pushed no longer replaces the screen. Every `cf_agent_chat_messages` frame that arrives before the socket knows what became of the stream it lost is held, and the latest is merged through `mergeMessages`, like a `get-messages` read. Frames after that are applied as any broadcast is, as before. In 0.5.x the first pushed frame replaced the transcript and `mergeMessages` was never called on this path.
+- `mergeMessages` now covers that path too: it is called with the replacement socket's stored transcript, read or pushed. A reply whose stream the server no longer runs is taken out of the screen's side first, so storage's copy of it is the whole of it, and a reply storage never held is dropped. A reply whose stream carries on is passed with the screen's text plus the tool calls, data parts and metadata only storage holds.
+- A stream a reopened socket did not start, such as a turn the server re-ran after its stream died, is now watched through the resume fallback instead of being handed to the AI SDK's resume. The SDK keeps the last message only when it has a tool call pending, so otherwise the re-run became a second assistant message.
+
+### 🩹 Fixes
+
+- A turn re-run while the socket was away now draws as one reply, whichever arrives first: the re-run's frames, the probe's answer or the stored transcript. The replacement socket holds the screen until it knows both how the stream it lost relates to what the server runs now and what storage holds, for at most three seconds. It then settles once, before the re-run's continuation takes in the screen, so a dead run's half-written step is not shown beside the re-run's. A late answer still settles the lost stream before its replay is drawn.
+- A replay counts as applied only from `replayComplete`, so a replay cut short by a second drop is replayed whole rather than skipped.
+- A transcript richer than the streaming reply is no longer overwritten by the stream's end.
+- A copy of a reply holding less work, tool calls or data parts, no longer takes the place of one holding more.
+- Clearing history while a reconnect is held no longer brings the cleared transcript back.
+- A resume probe that times out after its socket closed no longer settles the next socket's reconnect as having no stream.
+
 ## v0.5.1
 
 [compare changes](https://github.com/ymansurozer/agents-vue/compare/v0.5.0...v0.5.1)
