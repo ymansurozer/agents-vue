@@ -1304,6 +1304,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     ) {
       resumeInFlight = true;
       const myGeneration = resumeGeneration;
+      const probedFor = reconnect;
       void chat
         .resumeStream()
         .catch(() => {})
@@ -1315,8 +1316,9 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
           }
           resumeInFlight = false;
 
-          // A probe that settled without naming a stream says there is none.
-          if (reconnect && reconnect.offered === undefined) {
+          // A probe that settled without naming a stream says there is none — for the socket that
+          // sent it: one that timed out after its socket closed says nothing of the replacement's.
+          if (reconnect && reconnect === probedFor && reconnect.offered === undefined) {
             reconnect.offered = null;
             settleReconnect();
           }

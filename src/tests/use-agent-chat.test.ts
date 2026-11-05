@@ -2362,8 +2362,56 @@ describe("useAgentChat — a turn re-run while the socket was away", () => {
     own({ type: "text-start", id: "t1" }, { replay: true, seq: 1 });
     own({ type: "text-delta", id: "t1", delta: "The fee is" }, { replay: true, seq: 2 });
     client.emitMessage({ type: "cf_agent_use_chat_response", id: sent, body: "", replay: true, replayComplete: true });
+    await settle();
+    expect(chat.chat.status).not.toBe("error");
     own({ type: "text-delta", id: "t1", delta: " four hundred dollars." }, { seq: 3 });
     await settle();
+
+    expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
+    expect(texts(assistants(chat)[0])).toEqual(["The fee is four hundred dollars."]);
+    expect(chat.chat.status).not.toBe("error");
+    unmount();
+  });
+
+  it("keeps the client's reply through a blip whose first replacement closed before its probe was answered", async () => {
+    const { chat, client, unmount } = mountChat({ onError: () => {}, resyncOnReconnect: false });
+
+    await openAndProbe(client);
+    const probe = client.lastSentOfType<{ probeId: string }>("cf_agent_stream_resume_request");
+    client.emitMessage({ type: "cf_agent_stream_resume_none", probeId: probe?.probeId });
+    await settle();
+
+    const sent = await sendAndRequest(chat, client);
+    const own = (chunk: unknown, extra: Record<string, unknown> = {}) => respond(client, sent, chunk, { continuation: false, ...extra });
+    own({ type: "start", messageId: "a-reply" }, { seq: 0 });
+    own({ type: "text-start", id: "t1" }, { seq: 1 });
+    own({ type: "text-delta", id: "t1", delta: "The fee is" }, { seq: 2 });
+    await settle();
+
+    vi.useFakeTimers();
+    client.emit("close", new CloseEvent("close"));
+    await pause();
+    // A replacement that closes before the server answers its probe, which times out while the
+    // socket is still away.
+    client.emit("open", new Event("open"));
+    await pause();
+    client.emit("close", new CloseEvent("close"));
+    await vi.advanceTimersByTimeAsync(6_000);
+
+    client.emit("open", new Event("open"));
+    await pause();
+    client.emitMessage({ type: "cf_agent_chat_messages", messages: userTurn(chat) });
+    await pause();
+    expect(texts(assistants(chat)[0])).toEqual(["The fee is"]);
+
+    client.emitMessage({ type: "cf_agent_stream_resuming", id: sent });
+    own({ type: "start", messageId: "a-reply" }, { replay: true, seq: 0 });
+    own({ type: "text-start", id: "t1" }, { replay: true, seq: 1 });
+    own({ type: "text-delta", id: "t1", delta: "The fee is" }, { replay: true, seq: 2 });
+    own({ type: "text-delta", id: "t1", delta: " four hundred" }, { replay: true, seq: 3 });
+    client.emitMessage({ type: "cf_agent_use_chat_response", id: sent, body: "", replay: true, replayComplete: true });
+    own({ type: "text-delta", id: "t1", delta: " dollars." }, { seq: 4 });
+    await pause();
 
     expect(assistants(chat).map((m) => m.id)).toEqual(["a-reply"]);
     expect(texts(assistants(chat)[0])).toEqual(["The fee is four hundred dollars."]);
