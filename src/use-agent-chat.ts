@@ -20,6 +20,9 @@
  *   snapshot on connect and a turn that finished while this client was away is otherwise never
  *   seen — unless `resyncOnReconnect` is false, for a server that pushes one itself
  * - `onStateUpdate` forwarded to the `AgentClient`, which is where React's `useAgent` takes it
+ * - a turn a reopened socket did not start — one the server re-ran after its stream died — is watched
+ *   through the fallback rather than resumed through the SDK, which would start a second message
+ *   beside the one it continues; its replay skips the chunks this client already applied
  * - the four client-side bugs the Vue port carried, fixed against the React client: client-side
  *   tool calls dispatched off the rendered transcript rather than off the SDK's own callback; the
  *   early-continuation branch, so an announced continuation is observed or launched but never
@@ -29,8 +32,8 @@
  * The cross-tab observer upstream's React hook carries is deliberately left out.
  */
 import { Chat } from "@ai-sdk/vue";
-import { broadcastTransition } from "agents/chat";
-import type { BroadcastStreamState } from "agents/chat";
+import { broadcastTransition, StreamAccumulator } from "agents/chat";
+import type { BroadcastStreamState, StreamChunkData } from "agents/chat";
 import { WebSocketChatTransport } from "agents/chat/transport";
 import { AgentClient, type AgentClientOptions, type AgentConnectionError } from "agents/client";
 import {
@@ -115,8 +118,13 @@ export interface UseAgentChatOptions<
    */
   onFrame?: (frame: unknown) => boolean | void;
   /**
-   * How a transcript read back from the server is merged into the one on screen, used when a
-   * replacement socket re-reads `get-messages`.
+   * How a transcript read back from the server is merged into the one on screen, used for the stored
+   * transcript a replacement socket brings: its `get-messages` read, or a transcript the server
+   * pushes before the socket learns what became of the stream it lost — the latest of them, once it
+   * does. A reply whose stream the server no longer runs is taken out of the screen's side first,
+   * since storage's copy of it is the whole of it; one whose stream carries on is passed with the
+   * screen's text and storage's tool calls, data parts and metadata, since its replay skips what the
+   * screen already shows.
    *
    * The read is a round trip of its own: it can be issued before a turn is persisted and land
    * after the socket has already delivered the finished answer, so replacing the transcript with
@@ -132,8 +140,9 @@ export interface UseAgentChatOptions<
    *
    * Set it to false against a server that sends its stored transcript to every connection as it
    * opens, as a `cf_agent_chat_messages` frame, where the read would fetch the same transcript a
-   * second time. The frame is applied as any broadcast is, as a replace, so `mergeMessages` is never
-   * called; a merge of your own belongs in `onFrame`.
+   * second time. A replacement socket then reads nothing: the frames it is pushed are held until it
+   * knows what became of the stream it lost, and the latest is merged through `mergeMessages`; later
+   * ones are applied as any broadcast is.
    *
    * Only a reconnect is affected. The first open's `get-messages` seed runs unless `initialMessages`
    * is passed, with this option on or off.
@@ -181,6 +190,8 @@ interface ProtocolMessage<ChatMessage extends UIMessage = UIMessage> {
   recovering?: boolean;
   /** 0.23: which resume probe a STREAM_RESUME_NONE answers. */
   probeId?: string;
+  /** A stream chunk's position in its stream, which a replay repeats. */
+  seq?: number;
   message?: ChatMessage;
   messages?: ChatMessage[];
 }
@@ -213,6 +224,7 @@ function parseProtocolMessage<ChatMessage extends UIMessage>(parsed: unknown): P
     continuation: typeof parsed.continuation === "boolean" ? parsed.continuation : undefined,
     recovering: typeof parsed.recovering === "boolean" ? parsed.recovering : undefined,
     probeId: typeof parsed.probeId === "string" ? parsed.probeId : undefined,
+    seq: typeof parsed.seq === "number" ? parsed.seq : undefined,
     message,
     messages,
   };
@@ -312,6 +324,62 @@ function getErrorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * What a message holds that a copy of it can lose: its tool calls and its data parts. A data part is
+ * known by its id, or by its contents when it has none.
+ */
+function workKeyOf(part: UIMessage["parts"][number]): string | null {
+  if ("toolCallId" in part && typeof part.toolCallId === "string") {
+    return `tool:${part.toolCallId}`;
+  }
+  if (part.type.startsWith("data-")) {
+    const id = "id" in part && typeof part.id === "string" ? part.id : JSON.stringify("data" in part ? part.data : null);
+    return `${part.type}:${id}`;
+  }
+  return null;
+}
+
+function workKeysOf(message: UIMessage): Set<string> {
+  const keys = new Set<string>();
+  for (const part of message.parts) {
+    const key = workKeyOf(part);
+    if (key !== null) {
+      keys.add(key);
+    }
+  }
+  return keys;
+}
+
+/**
+ * `shown` with the tool calls, data parts and metadata only `stored` holds. Its text stands: a stream
+ * that carries on replays what the screen lacks of it, and skips what the screen already has.
+ */
+function withStoredWork<ChatMessage extends UIMessage>(shown: ChatMessage, stored: ChatMessage): ChatMessage {
+  const held = workKeysOf(shown);
+  const added = stored.parts.filter((part) => {
+    const key = workKeyOf(part);
+    return key !== null && !held.has(key);
+  });
+  const metadata =
+    isRecord(stored.metadata) || isRecord(shown.metadata) ? { ...asRecord(stored.metadata), ...asRecord(shown.metadata) } : undefined;
+
+  return {
+    ...shown,
+    parts: [...shown.parts, ...added],
+    ...(metadata !== undefined && { metadata }),
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
+}
+
+/** Whether `copy` holds every tool call and data part `other` does. */
+function holdsAllWorkOf(copy: UIMessage, other: UIMessage): boolean {
+  const held = workKeysOf(copy);
+  return [...workKeysOf(other)].every((key) => held.has(key));
+}
+
 function preserveActiveStreamMessages<ChatMessage extends UIMessage>(
   currentMessages: ChatMessage[],
   incomingMessages: ChatMessage[],
@@ -321,8 +389,13 @@ function preserveActiveStreamMessages<ChatMessage extends UIMessage>(
     return incomingMessages;
   }
 
+  // The streaming copy is kept over the incoming one only while it holds all the incoming one does:
+  // a copy missing work the server has recorded is behind it, however much text it has.
   const existingIndex = incomingMessages.findIndex((message) => message.id === tailMessage.id);
   if (existingIndex >= 0) {
+    if (!holdsAllWorkOf(tailMessage, incomingMessages[existingIndex]!)) {
+      return incomingMessages;
+    }
     const nextMessages = [...incomingMessages];
     nextMessages[existingIndex] = tailMessage;
     return nextMessages;
@@ -339,8 +412,8 @@ function preserveActiveStreamMessages<ChatMessage extends UIMessage>(
         (part) => "toolCallId" in part && typeof part.toolCallId === "string" && tailToolCallIds.has(part.toolCallId),
       ),
     );
-    if (remappedIndex >= 0) {
-      const remapped = incomingMessages[remappedIndex]!;
+    const remapped = incomingMessages[remappedIndex];
+    if (remapped && holdsAllWorkOf(tailMessage, remapped)) {
       const nextMessages = [...incomingMessages];
       nextMessages[remappedIndex] = { ...tailMessage, id: remapped.id };
       return nextMessages;
@@ -352,6 +425,13 @@ function preserveActiveStreamMessages<ChatMessage extends UIMessage>(
   // under the id this client minted while it was streaming.
   return incomingMessages;
 }
+
+/**
+ * How long a replacement socket holds the screen for the stored transcript and for word of the stream
+ * it lost before it shows what it has: a server that pushes no transcript, or a probe the server is
+ * slow to answer, would otherwise hold it for good. A late answer still settles the lost stream.
+ */
+const RECONNECT_SETTLE_MS = 3_000;
 
 /**
  * The chat states a tool continuation may not launch during. The AI SDK keeps one mutable active
@@ -415,6 +495,37 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
    * carries no message id — lands as a second assistant beside the one it continues.
    */
   let unreadFallbackStreamId: string | null = null;
+  /** The stream whose chunks this client received last, until its terminal frame. */
+  let drawingStreamId: string | null = null;
+  /**
+   * What a dropped socket leaves to settle, from its close until the replacement knows how the stream
+   * it lost relates to what the server runs now. Until then the screen is held: transcripts and the
+   * server's stream frames wait here, and are applied in `settleReconnect` once storage has answered
+   * too, so a continuation never takes in a dead stream's half of a step that storage is about to
+   * replace. The deadline releases the hold but keeps the record while the offer is unknown, so a
+   * late offer still settles the lost stream before its replay is drawn.
+   *
+   * - `lost`: the stream that was writing when the socket closed, and the message it was writing.
+   * - `offered`: the stream the replacement learned of — its probe's answer, an unprompted offer, or
+   *   a stream's first frame — `null` once it knows there is none, `undefined` until then.
+   * - `snapshot`: the latest stored transcript — the `get-messages` read or a transcript frame —
+   *   `null` when the read failed, `undefined` until one lands.
+   * - `frames`: the server stream frames held meanwhile.
+   * - `released`: the deadline passed, so what arrives is applied at once.
+   */
+  let reconnect: {
+    lost: { streamId: string; messageId: string } | null;
+    offered: string | null | undefined;
+    snapshot: ChatMessage[] | null | undefined;
+    frames: ProtocolMessage<ChatMessage>[];
+    released: boolean;
+  } | null = null;
+  let reconnectDeadline: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * The highest replayed chunk of each stream not yet in the transcript: `broadcastTransition` holds a
+   * replay's chunks until `replayComplete`, and a chunk counts as applied only once it is on screen.
+   */
+  const unpublishedReplaySeqs = new Map<string, number>();
   let isResumingToolContinuation = false;
   /** Whether a continuation has been armed but not yet launched. */
   let pendingToolContinuation = false;
@@ -690,6 +801,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     streamState = broadcastTransition(streamState, { type: "clear" }).state;
     chat.messages = [];
     heldMessageIds = [];
+    forgetReconnect();
     socket.send(JSON.stringify({ type: "cf_agent_chat_clear" }));
   }
 
@@ -766,6 +878,227 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     }
   }
 
+  /** Applies one frame of a server stream this client did not start the request for. */
+  function applyServerStreamFrame(id: string, data: ProtocolMessage<ChatMessage>) {
+    // A turn another tab started is this tab's to stop too, since the state shows it Stop
+    // for it. `stop()` cancels only a turn the transport is tracking, and nothing else
+    // registers one this tab only watches.
+    if (!data.done && !data.error && transport.activeServerTurnId !== id) {
+      transport.observeServerTurn(id);
+    }
+
+    if (unreadFallbackStreamId === id) {
+      unreadFallbackStreamId = null;
+
+      if (data.continuation && streamState.status === "observing" && streamState.streamId === id) {
+        streamState = { status: "idle" };
+      }
+    }
+
+    const chunkData: StreamChunkData | undefined = data.body?.trim() ? JSON.parse(data.body) : undefined;
+    // A replay repeats a continuation from its first chunk, including those this client
+    // applied before its socket dropped. Its `start` still rebuilds the accumulator, which
+    // takes in what is on screen; the rest are already there.
+    const alreadyApplied = transport.appliedChunks.isAppliedReplay(id, data) && chunkData?.type !== "start";
+
+    const result = broadcastTransition(streamState, {
+      type: "response",
+      streamId: id,
+      messageId: createMessageId(),
+      chunkData: alreadyApplied ? undefined : chunkData,
+      done: data.done,
+      error: data.error,
+      replay: data.replay,
+      replayComplete: data.replayComplete,
+      continuation: data.continuation,
+      currentMessages: data.continuation ? chat.messages : undefined,
+    });
+
+    streamState = result.state;
+    isServerStreaming.value = result.isStreaming;
+    if (result.messagesUpdate) {
+      // broadcastTransition typed messagesUpdate over base UIMessage; we trust
+      // wire-tagged ChatMessage fields survive since transitions only touch base parts.
+      chat.messages = result.messagesUpdate(chat.messages) as ChatMessage[];
+    }
+
+    ledgerApplied(id, data, alreadyApplied, result.messagesUpdate !== undefined);
+
+    // A send whose socket closed under it ended in an error; the turn being live again
+    // here means it was not lost.
+    if (result.isStreaming && chunkData && chat.status === "error") {
+      chat.clearError();
+    }
+
+    if (data.done || data.error) {
+      // A server/observed turn finished: clear the recovery hint and stop tracking it.
+      isRecovering.value = false;
+      transport.handleServerTurnCompleted(id);
+
+      if (observedToolContinuationRequestId === id) {
+        resetToolContinuation();
+      }
+    }
+  }
+
+  /**
+   * Records in the transport's ledger the chunks of `id` now in the transcript. A replay's chunks are
+   * held until `replayComplete` publishes them, so they count from then: counted as they arrive, a
+   * replay cut short by another drop would be skipped by the next as already applied.
+   */
+  function ledgerApplied(
+    id: string,
+    data: ProtocolMessage<ChatMessage>,
+    alreadyApplied: boolean,
+    published: boolean,
+  ) {
+    if (data.done || data.error) {
+      transport.appliedChunks.forget(id);
+      unpublishedReplaySeqs.delete(id);
+      return;
+    }
+
+    if (data.replay && !data.replayComplete) {
+      if (!alreadyApplied && data.seq !== undefined) {
+        unpublishedReplaySeqs.set(id, Math.max(data.seq, unpublishedReplaySeqs.get(id) ?? -1));
+      }
+      return;
+    }
+
+    if (!published) {
+      return;
+    }
+
+    if (data.replayComplete) {
+      transport.appliedChunks.record(id, unpublishedReplaySeqs.get(id));
+      unpublishedReplaySeqs.delete(id);
+    }
+
+    if (!alreadyApplied && !data.replay) {
+      transport.appliedChunks.record(id, data.seq);
+    }
+  }
+
+  function noteDrawing(id: string, data: ProtocolMessage<ChatMessage>) {
+    if (data.done || data.error) {
+      drawingStreamId = drawingStreamId === id ? null : drawingStreamId;
+    } else if (data.body?.trim()) {
+      drawingStreamId = id;
+    }
+  }
+
+  /**
+   * Points an observed stream's accumulator at its message as the screen now holds it, after a
+   * transcript was applied mid-stream. The transcript's copy can hold work the stream never carried —
+   * a part storage added — and the accumulator's next merge, the stream's end included, would
+   * otherwise write its own parts back over it.
+   */
+  function followTranscript() {
+    const state = streamState;
+    if (state.status !== "observing") {
+      return;
+    }
+
+    const shown = chat.messages.find((message) => message.id === state.accumulator.messageId);
+    if (!shown) {
+      return;
+    }
+
+    streamState = {
+      ...state,
+      accumulator: new StreamAccumulator({
+        messageId: shown.id,
+        continuation: true,
+        existingParts: shown.parts,
+        existingMetadata: isRecord(shown.metadata) ? shown.metadata : undefined,
+      }),
+    };
+  }
+
+  /**
+   * Settles what a dropped socket left once the replacement knows enough, then applies the stream
+   * frames held meanwhile. Released by the deadline, it shows what is known each time something
+   * arrives, and ends once the offer is known: a stream drawn from then on cannot be settled again.
+   */
+  function settleReconnect() {
+    const pending = reconnect;
+    if (!pending) {
+      return;
+    }
+
+    const offerKnown = pending.lost === null || pending.offered !== undefined;
+    if (!pending.released && !(offerKnown && pending.snapshot !== undefined)) {
+      return;
+    }
+
+    if (offerKnown) {
+      forgetReconnect();
+    }
+
+    const { lost, offered, snapshot } = pending;
+    const lostStreamGone = lost !== null && offered !== undefined && offered !== lost.streamId;
+
+    if (lostStreamGone) {
+      // Whatever the server runs from here is replayed in full, so nothing of the lost one counts.
+      transport.appliedChunks.forget(lost.streamId);
+    }
+
+    if (snapshot) {
+      chat.messages = reconciledTranscript(chat.messages, snapshot, lost, lostStreamGone);
+      heldMessageIds = idsOf(snapshot);
+      followTranscript();
+    }
+
+    const frames = pending.frames.splice(0);
+    for (const frame of frames) {
+      if (frame.id) {
+        applyServerStreamFrame(frame.id, frame);
+      }
+    }
+  }
+
+  /**
+   * The screen after a reconnect, from what it showed and what storage holds. A stream that carries
+   * on can be ahead of storage, and its replay skips the chunks the screen already has, so the
+   * screen's copy of its message keeps its text, taking from storage's copy the tool calls, data
+   * parts and metadata it lacks; one that is gone (or not yet known to carry on) drew past storage
+   * only a step the server writes again, if at all, so storage's copy is the whole message — and
+   * where storage holds none of it, there is no message.
+   */
+  function reconciledTranscript(
+    onScreen: ChatMessage[],
+    stored: ChatMessage[],
+    lost: { streamId: string; messageId: string } | null,
+    lostStreamGone: boolean,
+  ): ChatMessage[] {
+    const merge = options.mergeMessages ?? mergeById;
+
+    if (lost === null) {
+      return merge(onScreen, stored);
+    }
+
+    if (lostStreamGone) {
+      return merge(
+        onScreen.filter((message) => message.id !== lost.messageId),
+        stored,
+      );
+    }
+
+    const shown = onScreen.find((message) => message.id === lost.messageId);
+    return merge(
+      onScreen,
+      shown ? stored.map((message) => (message.id === lost.messageId ? withStoredWork(shown, message) : message)) : stored,
+    );
+  }
+
+  function forgetReconnect() {
+    reconnect = null;
+    if (reconnectDeadline !== null) {
+      clearTimeout(reconnectDeadline);
+      reconnectDeadline = null;
+    }
+  }
+
   // Handle incoming WebSocket messages for state synchronization
   socket.addEventListener("message", (event: MessageEvent) => {
     try {
@@ -783,11 +1116,18 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
       switch (data.type) {
         // Full message list sync (sent on connect, and after every appendMessage / turn).
         case "cf_agent_chat_messages":
+          if (reconnect) {
+            reconnect.snapshot = data.messages ?? [];
+            settleReconnect();
+            break;
+          }
+
           chat.messages =
             chat.status === "streaming" || chat.status === "submitted" || streamState.status !== "idle"
               ? preserveActiveStreamMessages(chat.messages, data.messages ?? [])
               : (data.messages ?? []);
           heldMessageIds = idsOf(data.messages ?? []);
+          followTranscript();
           break;
 
         // Single message update (e.g. tool result applied)
@@ -800,6 +1140,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
 
         // Clear all messages
         case "cf_agent_chat_clear":
+          forgetReconnect();
           streamState = broadcastTransition(streamState, { type: "clear" }).state;
           chat.messages = [];
           heldMessageIds = [];
@@ -809,6 +1150,13 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
 
         // Forward resume handshake to transport
         case "cf_agent_stream_resuming": {
+          // The answer to the probe this socket sent on opening, naming a turn it did not start, is
+          // watched through the fallback below rather than handed to the SDK: `ai` resumes into the
+          // last message only when that has a tool call pending, and otherwise starts a second one.
+          if (data.id && resumeInFlight && !activeRequestIds.has(data.id) && transport.isAwaitingResume()) {
+            transport.cancelPendingResume();
+          }
+
           // The turn this client armed a continuation for, announced before the launch could
           // register its resolver. Observing it and launching anyway delivers the same turn
           // twice, so the launch is abandoned here — one or the other, never both.
@@ -846,6 +1194,11 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
             isRecovering.value = false;
             socket.send(JSON.stringify({ type: "cf_agent_stream_resume_ack", id: data.id }));
           }
+
+          if (data.id && reconnect && reconnect.offered === undefined) {
+            reconnect.offered = data.id;
+            settleReconnect();
+          }
           break;
         }
         // 0.23 carries the probe id, so a NONE answering an older probe cannot settle this one.
@@ -858,6 +1211,11 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
           // later tool result would decline to continue.
           if (settled && observedToolContinuationRequestId !== null) {
             resetToolContinuation();
+          }
+
+          if (settled && reconnect && reconnect.offered === undefined) {
+            reconnect.offered = null;
+            settleReconnect();
           }
           break;
         }
@@ -872,60 +1230,24 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
         case "cf_agent_use_chat_response":
           if (data.id) {
             trackStreamMessage(data.id, data);
+            noteDrawing(data.id, data);
           }
 
           if (!data.id || activeRequestIds.has(data.id)) {
             return;
           }
 
-          {
-            // A turn another tab started is this tab's to stop too, since the state shows it Stop
-            // for it. `stop()` cancels only a turn the transport is tracking, and nothing else
-            // registers one this tab only watches.
-            if (!data.done && !data.error && transport.activeServerTurnId !== data.id) {
-              transport.observeServerTurn(data.id);
-            }
+          if (reconnect) {
+            reconnect.offered ??= data.id;
 
-            if (unreadFallbackStreamId === data.id) {
-              unreadFallbackStreamId = null;
-
-              if (data.continuation && streamState.status === "observing" && streamState.streamId === data.id) {
-                streamState = { status: "idle" };
-              }
-            }
-
-            const chunkData = data.body?.trim() ? JSON.parse(data.body) : undefined;
-            const result = broadcastTransition(streamState, {
-              type: "response",
-              streamId: data.id,
-              messageId: createMessageId(),
-              chunkData,
-              done: data.done,
-              error: data.error,
-              replay: data.replay,
-              replayComplete: data.replayComplete,
-              continuation: data.continuation,
-              currentMessages: data.continuation ? chat.messages : undefined,
-            });
-
-            streamState = result.state;
-            isServerStreaming.value = result.isStreaming;
-            if (result.messagesUpdate) {
-              // broadcastTransition typed messagesUpdate over base UIMessage; we trust
-              // wire-tagged ChatMessage fields survive since transitions only touch base parts.
-              chat.messages = result.messagesUpdate(chat.messages) as ChatMessage[];
-            }
-
-            if (data.done || data.error) {
-              // A server/observed turn finished: clear the recovery hint and stop tracking it.
-              isRecovering.value = false;
-              transport.handleServerTurnCompleted(data.id);
-
-              if (observedToolContinuationRequestId === data.id) {
-                resetToolContinuation();
-              }
+            if (reconnect.lost !== null) {
+              reconnect.frames.push(data);
+              settleReconnect();
+              break;
             }
           }
+
+          applyServerStreamFrame(data.id, data);
           break;
       }
     } catch {
@@ -944,6 +1266,15 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     // `socket.url` is empty until PartySocket has resolved its URL provider, so the seed cannot
     // run at setup; the first open is the earliest point the HTTP twin of the socket URL exists.
     void seedInitialMessages();
+
+    if (reconnect) {
+      const pending = reconnect;
+      reconnectDeadline = setTimeout(() => {
+        reconnectDeadline = null;
+        pending.released = true;
+        settleReconnect();
+      }, RECONNECT_SETTLE_MS);
+    }
 
     if (resyncPending) {
       resyncPending = false;
@@ -973,6 +1304,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     ) {
       resumeInFlight = true;
       const myGeneration = resumeGeneration;
+      const probedFor = reconnect;
       void chat
         .resumeStream()
         .catch(() => {})
@@ -983,6 +1315,13 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
             return;
           }
           resumeInFlight = false;
+
+          // A probe that settled without naming a stream says there is none — for the socket that
+          // sent it: one that timed out after its socket closed says nothing of the replacement's.
+          if (reconnect && reconnect === probedFor && reconnect.offered === undefined) {
+            reconnect.offered = null;
+            settleReconnect();
+          }
         });
     }
   });
@@ -992,6 +1331,16 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
     fallbackAckedResumeRequestIds.clear();
     // A stream the socket was carrying is replayed from its `start` on the replacement, or never ends.
     streamMessageIds.clear();
+    const lastAssistantId = [...chat.messages].reverse().find((message) => message.role === "assistant")?.id;
+    const lost =
+      reconnect?.lost ??
+      (drawingStreamId !== null && lastAssistantId !== undefined
+        ? { streamId: drawingStreamId, messageId: lastAssistantId }
+        : null);
+    forgetReconnect();
+    reconnect = { lost, offered: undefined, snapshot: undefined, frames: [], released: false };
+    drawingStreamId = null;
+    unpublishedReplaySeqs.clear();
     isRecovering.value = false;
     connectionState.value = "reconnecting";
     resyncPending = options.resyncOnReconnect !== false;
@@ -1007,6 +1356,7 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   // Cleanup on scope disposal
   onScopeDispose(() => {
     fallbackAckedResumeRequestIds.clear();
+    forgetReconnect();
     resetToolContinuation();
     isRecovering.value = false;
     // Force the resume gate open and bump the generation so any orphaned in-flight
@@ -1074,6 +1424,12 @@ export function useAgentChat<AgentT = unknown, ChatMessage extends UIMessage = U
   /** What a reconnect reads, merged rather than taken wholesale. See the `mergeMessages` option. */
   async function resyncMessages() {
     const stored = await fetchStoredMessages();
+
+    if (reconnect) {
+      reconnect.snapshot = stored ?? reconnect.snapshot ?? null;
+      settleReconnect();
+      return;
+    }
 
     if (stored) {
       chat.messages = (options.mergeMessages ?? mergeById)(chat.messages, stored);
