@@ -308,7 +308,15 @@ pnpm lint
 pnpm build
 ```
 
-Releases are driven by [`changelogen`](https://github.com/unjs/changelogen) with conventional commits.
+Releases are driven by [`changelogen`](https://github.com/unjs/changelogen) with conventional commits. `pnpm release` runs lint, typecheck, test and build, then `changelogen --release --push`: it bumps the version from the commits since the last tag, writes `CHANGELOG.md`, commits, tags and pushes, and the tag's `release` workflow publishes to npm.
+
+On a 0.x version changelogen steps every bump down one, so a `feat` makes a patch and a breaking change a minor. To release a minor, name the version, which changelogen then takes as given:
+
+```bash
+pnpm release -r 0.7.0
+```
+
+Pass the flag straight after the script name, without `--`: pnpm hands a `--` on to the script, and changelogen then reads `-r` as a positional argument and ignores it.
 
 ## License
 

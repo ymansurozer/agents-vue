@@ -46,7 +46,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "typecheck": "vue-tsc --noEmit",
-    "release": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build && changelogen --release && git push --follow-tags"
+    "release": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build && changelogen --release --push"
   },
   "peerDependencies": {
     "@ai-sdk/vue": "^4.0.0",
